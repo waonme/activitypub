@@ -116,8 +116,7 @@ export const getLocalFollowerCcids = (actorURI: string): string[] =>
 
 interface LoadedRecord { key: string, schema: string, value: any, author: string, createdAt: string }
 
-// query APIのレスポンス封筒。@concrnt/client 2.0.1 の型定義は旧配列形式のままなので
-// クライアント更新までの間、ここで型を補う。
+// 現行query APIのレスポンス封筒。
 interface QueryPage { items: SignedDocument[], prev: string | null, next: string | null }
 
 // nextカーソルが尽きるまでページングする。sinceは閉区間なので境界行が重複して
@@ -128,10 +127,19 @@ const queryAllByPrefix = async (prefix: string, schema: string): Promise<LoadedR
     let since: string | undefined = undefined;
 
     for (;;) {
-        const page = await concrntApi.query(
-            { prefix, schema, limit: 100, order: 'asc', since },
+        // 対象レコードは公開情報なので、サブキーを持たないサービスアカウントで
+        // 不要な認証生成を試さず、公開APIとして取得する。
+        const page: QueryPage = await concrntApi.requestConcrntApi<QueryPage>(
             config.concrnt.domain,
-        ) as unknown as QueryPage;
+            'net.concrnt.core.query',
+            {
+                prefix,
+                schema,
+                limit: '100',
+                order: 'asc',
+                ...(since ? { since } : {}),
+            },
+        );
 
         for (const sd of page.items) {
             const doc = JSON.parse(sd.document);
