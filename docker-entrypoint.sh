@@ -4,9 +4,9 @@ set -eu
 CONFIG_PATH="${CONFIG_PATH:-/app/config.yaml}"
 export CONFIG_PATH
 
-if [ ! -f "$CONFIG_PATH" ]; then
-  echo "Config file not found: $CONFIG_PATH" >&2
-  echo "Mount config.yaml to /app/config.yaml, or set CONFIG_PATH to the mounted path." >&2
+if [ ! -e "$CONFIG_PATH" ]; then
+  echo "Config not found: $CONFIG_PATH" >&2
+  echo "Mount config.yaml to /app/config.yaml, or set CONFIG_PATH to a config file or directory." >&2
   exit 1
 fi
 

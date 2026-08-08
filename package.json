@@ -11,7 +11,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@concrnt/client": "2.0.1",
+    "@concrnt/client": "2.0.5",
     "@fedify/fedify": "2.3.4",
     "@fedify/hono": "2.3.4",
     "@fedify/redis": "2.3.4",

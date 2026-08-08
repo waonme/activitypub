@@ -5,12 +5,14 @@ import fedi, { buildPerson } from "./federation.ts";
 import { Announce, Create, Delete, Emoji, Follow, Image, isActor, Like, Note, PUBLIC_COLLECTION, Tombstone, Undo, Update } from '@fedify/vocab';
 
 import { getLogger } from "@logtape/logtape";
+import { type Document } from "@concrnt/client";
 
-import concrntApi, { commit, type CommitDocument } from "./concrnt.ts";
+import concrntApi, { commit } from "./concrnt.ts";
 import { config } from "./config.ts";
 import { buildNote, isPlainReroute, resolveApObjectUrl, SCHEMA_AP_NOTE, SCHEMA_REFERENCE, SCHEMA_LIKE, SCHEMA_REACTION, SCHEMA_DELETE } from "./convert.ts";
-import { SCHEMA_AP_FOLLOW, SCHEMA_AP_FOLLOWER, SCHEMA_AP_ACCEPT_STATE, AP_NAMESPACE, acceptStateKey, type ApFollowerValue, type ApAcceptStateValue } from "./schemas.ts";
+import { SCHEMA_AP_FOLLOW, SCHEMA_AP_FOLLOWER, SCHEMA_AP_ACCEPT_STATE, AP_NAMESPACE, acceptStateKey, settingsKey, type ApFollowerValue, type ApAcceptStateValue } from "./schemas.ts";
 import * as followStore from "./followStore.ts";
+import * as settingsStore from "./settingsStore.ts";
 
 interface CoreSignedDocument {
     document: string;
@@ -48,6 +50,9 @@ const refreshEntities = async () => {
         await followStore.ensureEntityFollowsLoaded(entity.ccid).catch((error) => {
             logger.error(`Failed to load follows for ${entity.ccid}: ${error}`);
         });
+        await settingsStore.ensureEntitySettingsLoaded(entity.ccid).catch((error) => {
+            logger.error(`Failed to load settings for ${entity.ccid}: ${error}`);
+        });
     }
 }
 
@@ -58,164 +63,187 @@ const loadOutboundLikes = async () => {
     for (const row of rows) outboundLikeCcfs.add(row.ccUri);
 }
 
-const handleTimelineEvent = async (entity: ApEntity, channel: string, msg: CoreEvent) => {
-
-    // タイムラインイベントで対象とするのは投稿の作成・削除のみ
-    if (msg.type !== "created" && msg.type !== "deleted") {
-        return;
-    }
-
-    const baseURL = new URL(config.activitypub.baseUrl);
-    const ctx = fedi.createContext(baseURL, undefined);
+// リモートタイムライン宛のイベントはローカルRedisに流れないため、タイムラインチャンネルの
+// 監視では投稿を拾えない。代わりに、必ずローカルにpublishされる「レコード自身のURIチャンネル」の
+// イベントを捕捉し、document.distributesと監視対象タイムライン(未設定ならhome-timeline)を
+// 前方一致で突合する。1投稿=1イベントなので複数タイムライン同時配布でも重複送信しない。
+const handleOwnRecordEvent = async (entity: ApEntity, channel: string, msg: CoreEvent) => {
 
     if (msg.type === "created") {
 
         // イベントに同梱された署名済みドキュメントを優先し、なければフェッチする
         const eventSD = msg.documents?.[channel];
-        let document: any = eventSD
+        const document: any = eventSD
             ? JSON.parse(eventSD.document)
-            : await concrntApi.getDocument<any>(channel);
-        let cckv: string = document.key!;
+            : await concrntApi.getDocument<any>(channel).catch(() => null);
+        if (document == null) return;
 
-        if (document.author != entity.ccid) {
-            return;
-        }
+        if (document.author !== entity.ccid || document.kind !== 'record') return;
 
-        // タイムラインには参照ドキュメントが配られるので、実体まで辿る
-        if (document.schema === SCHEMA_REFERENCE) {
-            cckv = document.value.href;
-            const refSD = eventSD?.references?.[cckv];
-            document = refSD
-                ? JSON.parse(refSD.document)
-                : await concrntApi.getDocument<any>(cckv).catch(() => null);
-            if (document == null) {
-                logger.error(`Failed to resolve referenced document: ${cckv}`);
-                return;
-            }
-        }
+        // タイムラインへ配られる参照レコードは実体レコード側のイベントで処理する(二重federate防止)
+        if (document.schema === SCHEMA_REFERENCE) return;
 
-        if (isPlainReroute(document)) {
-            // テキストなしreroute → Announce (boost)
-            const targetURI: string | undefined = document.value?.targetURI;
-            if (!targetURI) return;
+        const listenTimelines = settingsStore.getListenTimelines(entity.ccid);
+        const prefixes = listenTimelines.length > 0
+            ? listenTimelines
+            : [`cckv://${entity.ccid}/concrnt.world/profiles/main/home-timeline`];
 
-            const objectRef = await resolveApObjectUrl(ctx, targetURI);
-            if (!objectRef) {
-                logger.info(`Reroute target is not resolvable to an AP object, skipping: ${targetURI}`);
-                return;
-            }
+        const distributes: string[] = Array.isArray(document.distributes) ? document.distributes : [];
+        if (!distributes.some(dest => prefixes.some(prefix => dest.startsWith(prefix)))) return;
 
-            const announceId = new URL(`${config.activitypub.baseUrl}/ap/announces/${encodeURIComponent(cckv)}`);
-
-            await ctx.sendActivity(
-                { identifier: entity.id },
-                "followers",
-                new Announce({
-                    id: announceId,
-                    actor: ctx.getActorUri(entity.id),
-                    object: new URL(objectRef),
-                    tos: [PUBLIC_COLLECTION],
-                    ccs: [ctx.getFollowersUri(entity.id)],
-                }),
-            );
-
-            // unboost時にUndo(Announce)を送るための対応を記録
-            await db.insert(apObjectReference).values({
-                apObjectId: announceId.href,
-                ccUri: cckv,
-                refType: 'outbound-announce',
-                meta: { object: objectRef },
-            }).onConflictDoNothing();
-
-            return;
-        }
-
-        // 通常投稿・引用reroute → Create(Note)。
-        // 手元のdocumentから直接Noteを構築する(自己HTTP経由の再取得を避ける)。
-        const noteArgs = { identifier: entity.id, id: cckv };
-        const note = await buildNote(ctx, noteArgs, document);
-        if (note == null) {
-            logger.info(`Document does not resolve to a Note, skipping: ${cckv}`);
-            return;
-        }
-
-        const createActivity = new Create({
-            id: new URL("#activity", note.id ?? undefined),
-            object: note,
-            actors: note.attributionIds,
-            tos: note.toIds,
-            ccs: note.ccIds,
-        });
-
-        await ctx.sendActivity(
-            { identifier: entity.id },
-            "followers",
-            createActivity,
-        );
-
-        // メンション・リプライ相手(ccに含まれるアクター)には直接配送する。
-        // フォロワーの有無に関わらず届ける必要がある。
-        const followersUri = ctx.getFollowersUri(entity.id).href;
-        const extraRecipients = (await Promise.all(
-            note.ccIds
-                .filter(cc => cc.href !== PUBLIC_COLLECTION.href && cc.href !== followersUri)
-                .map(cc => ctx.lookupObject(cc.href).catch(() => null))
-        )).filter(isActor);
-        if (extraRecipients.length > 0) {
-            await ctx.sendActivity(
-                { identifier: entity.id },
-                extraRecipients,
-                createActivity,
-            );
-        }
+        await handleOutboundCreate(entity, document.key ?? channel, document);
 
     } else if (msg.type === "deleted") {
+        // deletedは配布先チャンネルにも流れるため、レコード自身のチャンネルのイベントのみ処理
+        if (channel !== msg.uri) return;
+        await handleOutboundDelete(entity, msg.uri);
+    }
+}
 
-        const cckv = msg.uri;
+const handleOutboundCreate = async (entity: ApEntity, cckv: string, document: any) => {
 
-        // 削除対象がこのエンティティ自身のドキュメントであることを確認する
-        // (共有タイムライン上の他者コンテンツ削除で誤配信しない)
-        if (!cckv.startsWith(`cckv://${entity.ccid}/`)) {
+    const baseURL = new URL(config.activitypub.baseUrl);
+    const ctx = fedi.createContext(baseURL, undefined);
+
+    if (isPlainReroute(document)) {
+        // テキストなしreroute → Announce (boost)
+        const targetURI: string | undefined = document.value?.targetURI;
+        if (!targetURI) return;
+
+        const objectRef = await resolveApObjectUrl(ctx, targetURI);
+        if (!objectRef) {
+            logger.info(`Reroute target is not resolvable to an AP object, skipping: ${targetURI}`);
             return;
         }
 
-        // 送信済みAnnounceの削除ならUndo(Announce)を送る
-        const ref = await db.select().from(apObjectReference)
-            .where(eq(apObjectReference.ccUri, cckv)).limit(1).then(res => res[0]);
-
-        if (ref?.refType === 'outbound-announce') {
-            const announceId = new URL(ref.apObjectId);
-            await ctx.sendActivity(
-                { identifier: entity.id },
-                "followers",
-                new Undo({
-                    id: new URL("#undo", announceId),
-                    actor: ctx.getActorUri(entity.id),
-                    object: new Announce({
-                        id: announceId,
-                        actor: ctx.getActorUri(entity.id),
-                        object: ref.meta?.object ? new URL(ref.meta.object) : null,
-                    }),
-                    tos: [PUBLIC_COLLECTION],
-                }),
-            );
-            await db.delete(apObjectReference).where(eq(apObjectReference.apObjectId, ref.apObjectId));
-            return;
-        }
-
-        const noteArgs = { identifier: entity.id, id: cckv };
-        const noteURL = ctx.getObjectUri(Note, noteArgs);
+        const announceId = new URL(`${config.activitypub.baseUrl}/ap/announces/${encodeURIComponent(cckv)}`);
 
         await ctx.sendActivity(
             { identifier: entity.id },
             "followers",
-            new Delete({
-                id: new URL(`#delete-${Date.now()}`, noteURL),
+            new Announce({
+                id: announceId,
                 actor: ctx.getActorUri(entity.id),
-                object: new Tombstone({ id: noteURL }),
+                object: new URL(objectRef),
                 tos: [PUBLIC_COLLECTION],
-            })
+                ccs: [ctx.getFollowersUri(entity.id)],
+            }),
         );
+
+        // unboost時にUndo(Announce)を送るための対応を記録
+        await db.insert(apObjectReference).values({
+            apObjectId: announceId.href,
+            ccUri: cckv,
+            refType: 'outbound-announce',
+            meta: { object: objectRef },
+        }).onConflictDoNothing();
+
+        return;
+    }
+
+    // 通常投稿・引用reroute → Create(Note)。
+    // 手元のdocumentから直接Noteを構築する(自己HTTP経由の再取得を避ける)。
+    const noteArgs = { identifier: entity.id, id: cckv };
+    const note = await buildNote(ctx, noteArgs, document);
+    if (note == null) {
+        logger.info(`Document does not resolve to a Note, skipping: ${cckv}`);
+        return;
+    }
+
+    const createActivity = new Create({
+        id: new URL("#activity", note.id ?? undefined),
+        object: note,
+        actors: note.attributionIds,
+        tos: note.toIds,
+        ccs: note.ccIds,
+    });
+
+    await ctx.sendActivity(
+        { identifier: entity.id },
+        "followers",
+        createActivity,
+    );
+
+    // deletedイベントはdistributesを運ばず監視設定と突合できないため、
+    // 送信済みNoteを記録しておき、削除時はこの対応表で判定する
+    await db.insert(apObjectReference).values({
+        apObjectId: ctx.getObjectUri(Note, noteArgs).href,
+        ccUri: cckv,
+        refType: 'outbound-note',
+    }).onConflictDoNothing();
+
+    // メンション・リプライ相手(ccに含まれるアクター)には直接配送する。
+    // フォロワーの有無に関わらず届ける必要がある。
+    const followersUri = ctx.getFollowersUri(entity.id).href;
+    const documentLoader = await ctx.getDocumentLoader({ identifier: entity.id });
+    const extraRecipients = (await Promise.all(
+        note.ccIds
+            .filter(cc => cc.href !== PUBLIC_COLLECTION.href && cc.href !== followersUri)
+            .map(cc => ctx.lookupObject(cc.href, { documentLoader }).catch(() => null))
+    )).filter(isActor);
+    if (extraRecipients.length > 0) {
+        await ctx.sendActivity(
+            { identifier: entity.id },
+            extraRecipients,
+            createActivity,
+            // ローカル同士のメンションがAPブリッジ経由で二重通知されるのを防ぐ
+            { excludeBaseUris: [baseURL] },
+        );
+    }
+}
+
+const handleOutboundDelete = async (entity: ApEntity, cckv: string) => {
+
+    const ctx = fedi.createContext(new URL(config.activitypub.baseUrl), undefined);
+
+    const refs = await db.select().from(apObjectReference)
+        .where(eq(apObjectReference.ccUri, cckv));
+
+    // 送信済みAnnounceの削除ならUndo(Announce)を送る
+    const announceRef = refs.find(ref => ref.refType === 'outbound-announce');
+    if (announceRef) {
+        const announceId = new URL(announceRef.apObjectId);
+        await ctx.sendActivity(
+            { identifier: entity.id },
+            "followers",
+            new Undo({
+                id: new URL("#undo", announceId),
+                actor: ctx.getActorUri(entity.id),
+                object: new Announce({
+                    id: announceId,
+                    actor: ctx.getActorUri(entity.id),
+                    object: announceRef.meta?.object ? new URL(announceRef.meta.object) : null,
+                }),
+                tos: [PUBLIC_COLLECTION],
+            }),
+        );
+        await db.delete(apObjectReference).where(eq(apObjectReference.apObjectId, announceRef.apObjectId));
+        return;
+    }
+
+    // Note未送信のレコード削除(follows/settings等)でDelete(Tombstone)を誤配信しない。
+    // outbound-note記録開始以前にfederate済みのNoteの救済として、投稿キーのパターンに
+    // 一致する場合のみ記録なしでもDeleteを送る。
+    const noteRef = refs.find(ref => ref.refType === 'outbound-note');
+    const isPostKey = cckv.startsWith(`cckv://${entity.ccid}/concrnt.world/profiles/`) && cckv.includes('/posts/');
+    if (!noteRef && !isPostKey) return;
+
+    const noteArgs = { identifier: entity.id, id: cckv };
+    const noteURL = ctx.getObjectUri(Note, noteArgs);
+
+    await ctx.sendActivity(
+        { identifier: entity.id },
+        "followers",
+        new Delete({
+            id: new URL(`#delete-${Date.now()}`, noteURL),
+            actor: ctx.getActorUri(entity.id),
+            object: new Tombstone({ id: noteURL }),
+            tos: [PUBLIC_COLLECTION],
+        })
+    );
+
+    if (noteRef) {
+        await db.delete(apObjectReference).where(eq(apObjectReference.apObjectId, noteRef.apObjectId));
     }
 }
 
@@ -231,7 +259,7 @@ const handleProfileUpdate = async (entity: ApEntity) => {
         { identifier: entity.id },
         "followers",
         new Update({
-            id: new URL(`${config.activitypub.baseUrl}/ap/acct/${entity.id}#update-${Date.now()}`),
+            id: new URL(`${config.activitypub.baseUrl}/ap/${config.activitypub.actorPathSegment}/${entity.id}#update-${Date.now()}`),
             actor: ctx.getActorUri(entity.id),
             object: person,
             tos: [PUBLIC_COLLECTION],
@@ -269,7 +297,7 @@ const handleAssociationEvent = async (msg: CoreEvent) => {
 
     // Like対象は ap/note.json (リモート投稿の参照) でなければ連合しない。
     // 受信Announceも同じinbox名前空間にreroute記録を保存するため、スキーマで判別する。
-    const target = await concrntApi.getDocument<any>(msg.uri).catch(() => null);
+    const target = await concrntApi.getDocument<any>(msg.uri, undefined, { negativeTTL: 300_000 }).catch(() => null);
     if (target == null || target.schema !== SCHEMA_AP_NOTE || !target.value?.actorURL || !target.value?.noteURL) {
         logger.info(`Association target is not a bridgeable AP note, skipping: ${msg.uri}`);
         return;
@@ -280,7 +308,8 @@ const handleAssociationEvent = async (msg: CoreEvent) => {
 
     const ctx = fedi.createContext(new URL(config.activitypub.baseUrl), undefined);
 
-    const actor = await ctx.lookupObject(actorURL.href);
+    const documentLoader = await ctx.getDocumentLoader({ identifier: likerEntity.id });
+    const actor = await ctx.lookupObject(actorURL.href, { documentLoader });
     if (!actor || !isActor(actor)) {
         logger.error(`Failed to fetch actor for association: ${actorURL.href}`);
         return;
@@ -365,7 +394,8 @@ const handleAssociationDeleted = async (msg: CoreEvent) => {
 
     const ctx = fedi.createContext(new URL(config.activitypub.baseUrl), undefined);
 
-    const actor = await ctx.lookupObject(actorURL);
+    const documentLoader = await ctx.getDocumentLoader({ identifier: likerId });
+    const actor = await ctx.lookupObject(actorURL, { documentLoader });
     if (!actor || !isActor(actor)) {
         logger.error(`Failed to fetch actor for undo like: ${actorURL}`);
         return;
@@ -396,7 +426,7 @@ const followActivityId = (recordKey: string) =>
     new URL(`${config.activitypub.baseUrl}/ap/follows/${encodeURIComponent(recordKey)}`);
 
 const deleteServiceRecord = async (key: string) => {
-    const document: CommitDocument<string> = {
+    const document: Document<string> = {
         kind: 'delete',
         schema: SCHEMA_DELETE,
         value: key,
@@ -447,7 +477,8 @@ const handleFollowRecordEvent = async (entity: ApEntity, channel: string, msg: C
         followStore.setFollowing({ ccid: entity.ccid, key: channel, actorURI });
 
         try {
-            const actor = await ctx.lookupObject(actorURI);
+            const documentLoader = await ctx.getDocumentLoader({ identifier: entity.id });
+            const actor = await ctx.lookupObject(actorURI, { documentLoader });
             if (actor == null || !isActor(actor) || actor.id == null) {
                 logger.warn(`Follow target does not resolve to an actor: ${actorURI}`);
                 followStore.removeFollowingByKey(channel);
@@ -483,7 +514,8 @@ const handleFollowRecordEvent = async (entity: ApEntity, channel: string, msg: C
         if (!ref || ref.kind !== 'follow' || ref.ccid !== entity.ccid) return;
         const actorURI = ref.actorURI;
 
-        const actor = await ctx.lookupObject(actorURI).catch(() => null);
+        const documentLoader = await ctx.getDocumentLoader({ identifier: entity.id });
+        const actor = await ctx.lookupObject(actorURI, { documentLoader }).catch(() => null);
         if (actor != null && isActor(actor)) {
             await ctx.sendActivity(
                 { identifier: entity.id },
@@ -587,16 +619,14 @@ export const startEntityBroker = async () => {
             for (const entity of entities) {
                 if (!entity.enabled) continue;
 
-                // 監視対象タイムライン(未設定ならhome-timeline)
-                const timelines = entity.listenTimelines.length > 0
-                    ? entity.listenTimelines
-                    : [`cckv://${entity.ccid}/concrnt.world/profiles/main/home-timeline`];
+                // 自分の空間のレコードイベント → distributesと監視対象タイムラインを突合して転送
+                if (channel.startsWith(`cckv://${entity.ccid}/`)) {
+                    await handleOwnRecordEvent(entity, channel, msg);
+                }
 
-                for (const prefix of timelines) {
-                    if (channel.startsWith(prefix)) {
-                        await handleTimelineEvent(entity, channel, msg);
-                        break;
-                    }
+                // 監視対象タイムライン設定の更新 → 即時反映
+                if (channel === settingsKey(entity.ccid)) {
+                    await settingsStore.applyEvent(entity.ccid, msg);
                 }
 
                 // プロフィール更新(kv上書きでもcreatedが発火する)
@@ -637,4 +667,9 @@ export const startEntityBroker = async () => {
     await followStore.initialize(entities.map(e => e.ccid)).catch((error) => {
         logger.error(`followStore initialization failed (will retry on refresh): ${error}`);
     });
+    for (const entity of entities) {
+        await settingsStore.ensureEntitySettingsLoaded(entity.ccid).catch((error) => {
+            logger.error(`Failed to load settings for ${entity.ccid} (will retry on refresh): ${error}`);
+        });
+    }
 }

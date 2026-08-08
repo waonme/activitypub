@@ -1,0 +1,1 @@
+ALTER TABLE "ap_entities" DROP COLUMN "listen_timelines";

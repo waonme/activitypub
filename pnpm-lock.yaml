@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@concrnt/client':
-        specifier: 2.0.1
-        version: 2.0.1
+        specifier: 2.0.5
+        version: 2.0.5
       '@fedify/fedify':
         specifier: 2.3.4
         version: 2.3.4
@@ -147,8 +147,8 @@ packages:
   '@cfworker/json-schema@4.1.1':
     resolution: {integrity: sha512-gAmrUZSGtKc3AiBL71iNWxDsyUC5uMaKKGdvzYsBoTW/xi42JQHl7eKV2OYzCUqvc+D2RCcf7EXY2iCyFIk6og==}
 
-  '@concrnt/client@2.0.1':
-    resolution: {integrity: sha512-znj8F1/gWRUTciK4LMSqQC9JRw3W4QHYq6wcMhYuwYvg6X9iSrjFQXQU7tC7L4gs8ooGb7yeMQGrO3mO292TRQ==}
+  '@concrnt/client@2.0.5':
+    resolution: {integrity: sha512-SFICirehNsJdRi7za8tybaSV7LBSiu5rDUBmyCJJaw8vy+eLZ3lNzMJcWz0GjdJ5t/O4khDoKUDEOpDsSMrsDg==}
 
   '@cosmjs/amino@0.33.1':
     resolution: {integrity: sha512-WfWiBf2EbIWpwKG9AOcsIIkR717SY+JdlXM/SL/bI66BdrhniAF+/ZNis9Vo9HF6lP2UU5XrSmFA4snAvEgdrg==}
@@ -2063,7 +2063,7 @@ snapshots:
 
   '@cfworker/json-schema@4.1.1': {}
 
-  '@concrnt/client@2.0.1':
+  '@concrnt/client@2.0.5':
     dependencies:
       '@cosmjs/amino': 0.33.1
       '@cosmjs/crypto': 0.33.1

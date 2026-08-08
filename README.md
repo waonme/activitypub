@@ -27,11 +27,13 @@ Fediverse ⇄ [Fedify federation (src/federation.ts)] ⇄ concrnt core
 | `m/reroute.json` (bodyあり) | `Create{Note}` + `quoteUrl` | 送信 |
 | `a/like.json` | `Like` | 双方向 |
 | `a/reaction.json` | `Like` + `Emoji` tag / `EmojiReact` | 双方向 |
+| `a/mention.json` | `Create{Note}` + `Mention` tag | 受信 |
+| `a/reply.json` | `Create{Note}` + `inReplyTo` (ローカル投稿宛て) | 受信 |
 | `ap/note.json` | リモート Note への軽量参照 | 受信 |
 | `delete.json` | `Delete` / `Undo` | 双方向 |
 | `p/main.json` | `Person` (name/summary/icon) + `Update` | 送信 |
 
-受信したリモート投稿は `ap/note.json` (`{actorURL, noteURL}`) として、ActivityPub の `to` / `cc` に対応するローカル受信者の inbox タイムラインへ配送します。表示時はリモートURLを解決し、フォロワー限定・ダイレクト投稿のように後から再取得できない場合は受信時のスナップショットへフォールバックします。限定投稿の参照レコードとスナップショットは配送先のCCIDだけが読めます。受信 boost は同様にサービスアカウント名義の `m/reroute.json` + `profileOverride` で表現します。
+受信したリモート投稿は本文を複製せず、`ap/note.json` (`{actorURL, noteURL}`) としてフォロワーの inbox タイムラインへ配送します(表示時にクライアントが解決)。受信 boost は同様にサービスアカウント名義の `m/reroute.json` + `profileOverride` で表現します。
 
 AP オブジェクト ⇄ concrnt URI の対応は、note/announce は URL ハッシュによる決定的キー、like/reaction と送信済み activity は `ap_object_references` テーブルで管理します。
 
@@ -45,9 +47,11 @@ pnpm dev        # 開発 (tsx watch)
 pnpm prod       # 本番
 ```
 
-既存インストールからアクターURLを維持する必要がある場合は、`activitypub.actorPathSegment` を従来のパスセグメントに設定します。新規インストールの既定値は `users` です。
-
 必要なもの: Postgres、Redis(concrnt コアと同じインスタンス)、concrnt コア。
+
+設定は環境変数 `CONFIG_PATH` で場所を指定できます(既定はリポジトリルートの `config.yaml`)。concrnt 本体と同様にディレクトリを指定することもでき、その場合は中のファイルをファイル名昇順で読み、後のファイルが前のファイルを深いマージで上書きします(秘匿値だけ `secret.yaml` に分ける、といった運用向け)。
+
+既存インストールのActor URLを維持する必要がある場合は、`activitypub.actorPathSegment` に従来のパスセグメントを設定します。未指定時は `acct` です。
 
 concrnt 本体のゲートウェイにサービスとして登録します (本体 config.yaml の `services:`):
 

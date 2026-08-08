@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isPlainReroute, parseEmojiShortcode, SCHEMA_REROUTE, SCHEMA_AP_NOTE, followKey, followerKey, acceptStateKey } from './schemas.ts';
+import { isPlainReroute, parseEmojiShortcode, SCHEMA_REROUTE, SCHEMA_AP_NOTE, followKey, followerKey, acceptStateKey, settingsKey } from './schemas.ts';
 
 describe('isPlainReroute', () => {
     it('bodyのないrerouteはboost扱い', () => {
@@ -73,5 +73,9 @@ describe('フォロー関連キー導出', () => {
         expect(followerKey(svc, user, actor)).not.toBe(followerKey(svc, 'con1other', actor));
         // followerとaccept-stateは同じハッシュ入力でもプレフィックスで区別される
         expect(followerKey(svc, user, actor)).not.toBe(acceptStateKey(svc, user, actor));
+    });
+
+    it('settingsキーはユーザー空間の固定パス', () => {
+        expect(settingsKey(user)).toBe(`cckv://${user}/activitypub.concrnt.world/settings`);
     });
 });

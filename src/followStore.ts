@@ -11,7 +11,6 @@
 // 対象外(公開レコード前提)。
 
 import { getLogger } from "@logtape/logtape";
-import type { SignedDocument } from "@concrnt/client";
 
 import concrntApi from "./concrnt.ts";
 import { config } from "./config.ts";
@@ -116,29 +115,18 @@ export const getLocalFollowerCcids = (actorURI: string): string[] =>
 
 interface LoadedRecord { key: string, schema: string, value: any, author: string, createdAt: string }
 
-// 現行query APIのレスポンス封筒。
-interface QueryPage { items: SignedDocument[], prev: string | null, next: string | null }
-
 // nextカーソルが尽きるまでページングする。sinceは閉区間なので境界行が重複して
-// 返るため、キーで重複排除する。itemsは読取権限フィルタ後の内容なので、
-// 空ページでもnextがあれば継続する必要がある。
+// 返るため、キーで重複排除する(同一キーの更新版は後勝ち。queryAllのccfs基準
+// dedupeとは異なる挙動が必要なため自前実装)。itemsは読取権限フィルタ後の
+// 内容なので、空ページでもnextがあれば継続する必要がある。
 const queryAllByPrefix = async (prefix: string, schema: string): Promise<LoadedRecord[]> => {
     const results = new Map<string, LoadedRecord>();
     let since: string | undefined = undefined;
 
     for (;;) {
-        // 対象レコードは公開情報なので、サブキーを持たないサービスアカウントで
-        // 不要な認証生成を試さず、公開APIとして取得する。
-        const page: QueryPage = await concrntApi.requestConcrntApi<QueryPage>(
+        const page = await concrntApi.query(
+            { prefix, schema, limit: 100, order: 'asc', since },
             config.concrnt.domain,
-            'net.concrnt.core.query',
-            {
-                prefix,
-                schema,
-                limit: '100',
-                order: 'asc',
-                ...(since ? { since } : {}),
-            },
         );
 
         for (const sd of page.items) {
@@ -148,7 +136,14 @@ const queryAllByPrefix = async (prefix: string, schema: string): Promise<LoadedR
             results.set(key, { key, schema: doc.schema, value: doc.value, author: doc.author, createdAt: doc.createdAt });
         }
 
-        if (page.next === null || page.next === since) break;
+        if (page.next === null) break;
+        if (page.next === since) {
+            // カーソルはcreatedAtのみなので、同一createdAtの行が1ページを超えて
+            // 並ぶとnextが同じ値のまま前進できない。この分岐に入った時点で
+            // 未取得の行が確実に残っている(nextはlimit+1行目のcreatedAt)。
+            logger.warn(`queryAllByPrefix: pagination stalled at ${page.next} for ${prefix}; loaded only ${results.size} records, results are incomplete`);
+            break;
+        }
         since = page.next;
     }
 

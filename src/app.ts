@@ -4,12 +4,13 @@ import { Hono, type Context as HonoContext } from "hono";
 import { cors } from "hono/cors";
 import { federation } from "@fedify/hono";
 import { getLogger } from "@logtape/logtape";
-import fedi from "./federation.ts";
-import { db, apEntity, apInboundObject } from "./db/index.ts"
+import fedi, { INSTANCE_ACTOR, storeApNote } from "./federation.ts";
+import { Note, PUBLIC_COLLECTION } from "@fedify/vocab";
+import { db, apEntity } from "./db/index.ts"
 import { eq } from "drizzle-orm";
 import { config } from "./config.ts";
 import * as followStore from "./followStore.ts";
-import { canReadInboundObject, isRestrictedInboundVisibility } from "./inbound.ts";
+import * as objectCache from "./objectCache.ts";
 
 const logger = getLogger("activitypub");
 
@@ -22,7 +23,6 @@ const receiveAuthInfo = (c: HonoContext): AuthInfo | null => {
     const authInfoStr = c.req.header("cc-requester")
     logger.debug(`Received request with auth info: ${authInfoStr}`);
     if (!authInfoStr) return null;
-
     try {
         const authInfo = JSON.parse(authInfoStr) as Partial<AuthInfo>;
         return typeof authInfo.ccid === "string" ? { ccid: authInfo.ccid } : null;
@@ -49,11 +49,12 @@ const pkg = JSON.parse(
 const ccEndpoints: Record<string, string> = {
     "net.concrnt.activitypub.info":      "/ap/api/info",
     "net.concrnt.activitypub.setup":     "/ap/api/setup",      // POST {id}
-    "net.concrnt.activitypub.settings":  "/ap/api/settings",   // GET=取得 / POST=更新
+    "net.concrnt.activitypub.settings":  "/ap/api/settings",   // GET=取得 (listenTimelines等のユーザー設定はcckvレコード側)
     "net.concrnt.activitypub.stats":     "/ap/api/stats",
     "net.concrnt.activitypub.followers": "/ap/api/followers",
     "net.concrnt.activitypub.following": "/ap/api/following",
     "net.concrnt.activitypub.resolve":   "/ap/api/resolve?uri={uri}",
+    "net.concrnt.activitypub.import":    "/ap/api/import",     // POST {uri}
 };
 
 // 以下2つは定期ポーリングされるため、fedifyミドルウェアより前に登録して
@@ -97,6 +98,9 @@ app.post("/ap/api/setup", async (c) => {
     if (!id) {
         return c.json({ error: "Missing 'id' in request body" }, 400);
     }
+    if (id.toLowerCase() === INSTANCE_ACTOR) {
+        return c.json({ error: `'${INSTANCE_ACTOR}' is a reserved id` }, 400);
+    }
 
     const ccid = authInfo.ccid
 
@@ -106,14 +110,12 @@ app.post("/ap/api/setup", async (c) => {
         id: id.toLowerCase(),
         ccid: ccid,
         enabled: true,
-        listenTimelines: [],
     })
 
     return c.json({
         id: id,
         ccid: ccid,
         enabled: true,
-        listenTimelines: [],
     })
 
 });
@@ -136,33 +138,7 @@ app.get("/ap/api/settings", async (c) => {
         ccid: entity.ccid,
         id: entity.id,
         enabled: entity.enabled,
-        listenTimelines: entity.listenTimelines,
     });
-});
-
-app.post("/ap/api/settings", async (c) => {
-
-    const authInfo = receiveAuthInfo(c)
-    if (!authInfo) {
-        return c.json({ error: "Missing authentication information" }, 400);
-    }
-
-    const id = authInfo.ccid
-
-    const entity = await db.select().from(apEntity).where(eq(apEntity.ccid, id)).limit(1).then(res => res[0]);
-    if (!entity) {
-        return c.json({ error: "No ActivityPub entity found for this user" }, 404);
-    }
-
-    const { listenTimelines } = await c.req.json();
-
-    await db.update(apEntity)
-        .set({
-            listenTimelines: listenTimelines ?? entity.listenTimelines,
-        })
-        .where(eq(apEntity.ccid, id));
-
-    return c.json({ message: "Settings updated successfully" });
 });
 
 
@@ -226,9 +202,10 @@ app.get("/ap/api/following", async (c) => {
 
     // フォローはユーザー署名のcckvレコード(follows/)がsource of truth。
     // フォロー・アンフォロー操作はクライアントがレコードをcommit/deleteすることで行う。
+    // レスポンス: { actorURI: string, status: 'accepted' | 'pending' }[]
     const following = followStore.getFollowing(entity.ccid)
         .filter(f => f.status !== 'rejected')
-        .map(f => f.actorURI);
+        .map(f => ({ actorURI: f.actorURI, status: f.status as 'accepted' | 'pending' }));
 
     return c.json(following);
 });
@@ -236,7 +213,6 @@ app.get("/ap/api/following", async (c) => {
 
 app.get("/ap/api/resolve", async (c) => {
     const ctx = fedi.createContext(c.req.raw, undefined);
-    const requester = receiveAuthInfo(c);
     let uri = c.req.query("uri")?.trim();
     if (typeof uri !== "string") {
         return c.json({ error: "Missing 'uri' query parameter" }, 400);
@@ -244,46 +220,121 @@ app.get("/ap/api/resolve", async (c) => {
     uri = decodeURIComponent(uri);
     uri = uri.replace(/^activity:\/\//, "https://");
 
-    const stored = await db.select().from(apInboundObject)
-        .where(eq(apInboundObject.objectId, uri)).limit(1).then(res => res[0]);
+    const authInfo = receiveAuthInfo(c);
+    const entity = authInfo
+        ? await db.select().from(apEntity).where(eq(apEntity.ccid, authInfo.ccid)).limit(1).then(res => res[0])
+        : undefined;
 
-    if (stored && !canReadInboundObject(stored.visibility, stored.recipientCcids, requester?.ccid)) {
-        // Do not disclose whether a restricted object exists to non-recipients.
-        return c.json({ error: "Object not found" }, 404);
+    // キャッシュヒットかつ閲覧可(読み出し時評価)なら即返す。許可がない場合は
+    // リモートfetchへフォールスルーして可否をリモートに委ねる
+    const cached = await objectCache.getObject(uri);
+    if (cached && objectCache.isVisibleTo(cached, authInfo
+        ? { ccid: authInfo.ccid, actorUri: entity ? ctx.getActorUri(entity.id).href : undefined }
+        : null)) {
+        return c.json(cached.json);
     }
 
-    // Followers-only/direct objects often cannot be dereferenced after inbox
-    // delivery.  Once the requester is authorized, prefer the exact payload
-    // received at delivery time instead of waiting for a remote 404.
-    if (stored && isRestrictedInboundVisibility(stored.visibility)) {
-        return c.json(stored.object);
-    }
+    // authorized fetch実装向けに、リクエストユーザー(AP未セットアップならインスタンス
+    // アクター)の鍵で署名して解決する
+    const documentLoader = await ctx.getDocumentLoader({ identifier: entity?.id ?? INSTANCE_ACTOR });
 
-    try {
-        const obj = await ctx.lookupObject(uri, { crossOrigin: 'trust' });
+    return await ctx.lookupObject(uri, { crossOrigin: 'trust', documentLoader }).then(async (obj) => {
         if (obj) {
             const jsonLd = await obj.toJsonLd() as Record<string, unknown>;
-            // Fedify vocab drops unknown Misskey extension properties during
-            // JSON-LD conversion, so restore them from the source document.
+            // fedifyのvocabは_misskey_content等の未知プロパティをJSON-LD変換で落とすため、生JSONから拾い直す
             try {
-                const raw = await ctx.documentLoader(obj.id?.href ?? uri);
+                const raw = await documentLoader(obj.id?.href ?? uri);
                 const rawDoc = raw.document as Record<string, unknown>;
                 for (const key of Object.keys(rawDoc)) {
                     if (key.startsWith("_misskey_")) jsonLd[key] = rawDoc[key];
                 }
-            } catch (error) {
-                logger.debug(`Failed to fetch raw document for ${uri}: ${error}`);
+            } catch (e) {
+                logger.debug(`failed to fetch raw document for ${uri}: ${e}`);
+            }
+            // publicオブジェクトはresolve結果もキャッシュしてリモートfetchを減らす
+            // (非publicのresolve結果はリモートの認可が要求者個人に紐づくため保存しない)
+            const addressed = [...obj.toIds, ...obj.ccIds].map(u => u.href);
+            if (addressed.includes(PUBLIC_COLLECTION.href)) {
+                const canonical = obj.id?.href ?? uri;
+                await objectCache.putObject(canonical, {
+                    json: jsonLd,
+                    actorUri: obj.attributionId?.href ?? '',
+                    addressed,
+                    receivedAt: new Date().toISOString(),
+                });
+                if (canonical !== uri) await objectCache.putAlias(uri, canonical);
             }
             return c.json(jsonLd);
+        } else {
+            logger.info(`Object not found for URI: ${uri}`);
+            return c.json({ error: "Object not found" }, 404);
         }
-    } catch (error) {
-        logger.info(`Live lookup failed for URI ${uri}; checking the delivered snapshot: ${error}`);
+    })
+});
+
+// リモートnoteをオンデマンドでconcrntレコード(ap/note.json)として実体化する。
+// プッシュ受信(Create/Announce)を経ていないnoteをクライアントが詳細ビューで扱えるようにするための入口。
+app.post("/ap/api/import", async (c) => {
+    const authInfo = receiveAuthInfo(c);
+    if (!authInfo) {
+        return c.json({ error: "Missing authentication information" }, 400);
     }
 
-    if (stored) return c.json(stored.object);
+    let uri: unknown;
+    try {
+        uri = (await c.req.json()).uri;
+    } catch {
+        return c.json({ error: "Invalid JSON body" }, 400);
+    }
+    if (typeof uri !== "string" || uri.trim() === "") {
+        return c.json({ error: "Missing 'uri' in request body" }, 400);
+    }
+    uri = decodeURIComponent(uri.trim()).replace(/^activity:\/\//, "https://");
 
-    logger.info(`Object not found for URI: ${uri}`);
-    return c.json({ error: "Object not found" }, 404);
+    // AP未セットアップのユーザーでも実体化は許可する(署名主体だけ使い分ける)
+    const entity = await db.select().from(apEntity)
+        .where(eq(apEntity.ccid, authInfo.ccid)).limit(1).then(res => res[0]);
+
+    const ctx = fedi.createContext(c.req.raw, undefined);
+    const documentLoader = await ctx.getDocumentLoader({ identifier: entity?.id ?? INSTANCE_ACTOR });
+
+    let obj;
+    try {
+        obj = await ctx.lookupObject(uri as string, { crossOrigin: 'trust', documentLoader });
+    } catch (e) {
+        logger.info(`import: failed to resolve ${uri}: ${e}`);
+        return c.json({ error: "Failed to fetch remote object" }, 502);
+    }
+    if (!obj) {
+        return c.json({ error: "Object not found" }, 404);
+    }
+    if (!(obj instanceof Note) || !obj.id) {
+        return c.json({ error: "Object is not a Note" }, 422);
+    }
+    const actorURL = obj.attributionId?.href;
+    if (!actorURL) {
+        return c.json({ error: "Note has no attributedTo" }, 422);
+    }
+
+    // キーは正準ID(obj.id)から導出する。決定的キーへの再commitなので冪等。
+    // 配送はしない(詳細ビューから参照できれば十分。Announce内側noteと同じ扱い)。
+    // publishedがbackdate window(7日)より古い投稿を取り込めるようimport経路で実体化する
+    let key;
+    try {
+        key = await storeApNote(
+            obj.id.href,
+            actorURL,
+            obj.published ? new Date(obj.published.toString()) : new Date(),
+            [],
+            { viaImport: true },
+        );
+    } catch (e) {
+        logger.warn(`import: failed to store ${obj.id.href}: ${e}`);
+        return c.json({ error: `Failed to store note: ${e instanceof Error ? e.message : e}` }, 500);
+    }
+
+    logger.info(`import: stored ${obj.id.href} as ${key} (requested by ${authInfo.ccid})`);
+    return c.json({ key });
 });
 
 export default app;

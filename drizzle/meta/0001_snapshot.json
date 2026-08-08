@@ -1,5 +1,5 @@
 {
-  "id": "31c419f8-4c2b-47d3-b77f-c0ab9f533449",
+  "id": "4e00e484-f278-4945-97c6-4140d8d662f6",
   "prevId": "c6b93d28-a73d-4640-8543-791e99a1520f",
   "version": "7",
   "dialect": "postgresql",
@@ -19,13 +19,6 @@
           "type": "text",
           "primaryKey": false,
           "notNull": true
-        },
-        "listen_timelines": {
-          "name": "listen_timelines",
-          "type": "text[]",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'{}'"
         },
         "enabled": {
           "name": "enabled",
@@ -54,80 +47,6 @@
           ]
         }
       },
-      "policies": {},
-      "checkConstraints": {},
-      "isRLSEnabled": false
-    },
-    "public.ap_inbound_objects": {
-      "name": "ap_inbound_objects",
-      "schema": "",
-      "columns": {
-        "object_id": {
-          "name": "object_id",
-          "type": "text",
-          "primaryKey": true,
-          "notNull": true
-        },
-        "actor_id": {
-          "name": "actor_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "object": {
-          "name": "object",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "recipient_ccids": {
-          "name": "recipient_ccids",
-          "type": "text[]",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'{}'"
-        },
-        "visibility": {
-          "name": "visibility",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "c_date": {
-          "name": "c_date",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        },
-        "updated_at": {
-          "name": "updated_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        }
-      },
-      "indexes": {
-        "ap_inbound_objects_actor_id_idx": {
-          "name": "ap_inbound_objects_actor_id_idx",
-          "columns": [
-            {
-              "expression": "actor_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
       "policies": {},
       "checkConstraints": {},
       "isRLSEnabled": false

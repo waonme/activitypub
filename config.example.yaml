@@ -9,10 +9,11 @@ redis:
 
 concrnt:
   domain: concrnt.example.com
-  # ccid is derived from privateKey and does not need to be configured.
-  privateKey: |
-    replace-with-your-concrnt-private-key
+  # ccidはprivateKeyから導出されるため設定不要
+  privateKey: replace-with-your-concrnt-private-key
 
-activitypub:
-  # Change only when preserving actor URLs from an existing installation.
-  actorPathSegment: users
+# activitypub:
+#   # 既存環境のActor URLを維持するときだけ変更する（既定: acct）
+#   actorPathSegment: acct
+#   # 受信ノート本文のRedisキャッシュTTL(秒)。デフォルト30日
+#   objectCacheTTL: 2592000
