@@ -21,9 +21,15 @@ interface AuthInfo {
 
 const receiveAuthInfo = (c: HonoContext): AuthInfo | null => {
     const authInfoStr = c.req.header("cc-requester")
-    const authInfo = authInfoStr ? JSON.parse(authInfoStr) as AuthInfo : null;
     logger.debug(`Received request with auth info: ${authInfoStr}`);
-    return authInfo;
+    if (!authInfoStr) return null;
+    try {
+        const authInfo = JSON.parse(authInfoStr) as Partial<AuthInfo>;
+        return typeof authInfo.ccid === "string" ? { ccid: authInfo.ccid } : null;
+    } catch {
+        logger.warn("Received malformed cc-requester header");
+        return null;
+    }
 }
 
 

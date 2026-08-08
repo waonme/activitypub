@@ -21,6 +21,7 @@ export interface AppConfig {
   };
   activitypub: {
     baseUrl: string;
+    actorPathSegment: string;
     objectCacheTTL: number; // seconds
   };
 }
@@ -75,6 +76,14 @@ const expectHost = (value: unknown, path: string): string => {
   new URL(`https://${host}`);
 
   return host;
+};
+
+const expectPathSegment = (value: unknown, path: string): string => {
+  const segment = expectString(value, path);
+  if (!/^[A-Za-z0-9._~-]+$/.test(segment)) {
+    throw new Error(`Invalid config: "${path}" must be one URL path segment.`);
+  }
+  return segment;
 };
 
 // concrnt本体のDeepMergeと同じ規則: マップは再帰、それ以外は後勝ちで置換、
@@ -156,6 +165,9 @@ const readConfig = (): AppConfig => {
     },
     activitypub: {
       baseUrl: activitypubBaseUrl,
+      actorPathSegment: activitypub.actorPathSegment === undefined
+        ? "acct"
+        : expectPathSegment(activitypub.actorPathSegment, "activitypub.actorPathSegment"),
       objectCacheTTL: activitypub.objectCacheTTL === undefined
         ? 30 * 24 * 60 * 60
         : expectNumber(activitypub.objectCacheTTL, "activitypub.objectCacheTTL"),

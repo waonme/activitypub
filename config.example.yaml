@@ -13,5 +13,7 @@ concrnt:
   privateKey: replace-with-your-concrnt-private-key
 
 # activitypub:
+#   # 既存環境のActor URLを維持するときだけ変更する（既定: acct）
+#   actorPathSegment: acct
 #   # 受信ノート本文のRedisキャッシュTTL(秒)。デフォルト30日
 #   objectCacheTTL: 2592000

@@ -259,7 +259,7 @@ const handleProfileUpdate = async (entity: ApEntity) => {
         { identifier: entity.id },
         "followers",
         new Update({
-            id: new URL(`${config.activitypub.baseUrl}/ap/acct/${entity.id}#update-${Date.now()}`),
+            id: new URL(`${config.activitypub.baseUrl}/ap/${config.activitypub.actorPathSegment}/${entity.id}#update-${Date.now()}`),
             actor: ctx.getActorUri(entity.id),
             object: person,
             tos: [PUBLIC_COLLECTION],

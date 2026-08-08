@@ -22,6 +22,7 @@ const logger = getLogger("activitypub");
 // fetch(共有インボックスの署名検証・匿名resolve)の署名主体として使う。
 // setup側でこのidの登録を拒否して予約する。
 export const INSTANCE_ACTOR = "instance.actor";
+const actorPath = `/ap/${config.activitypub.actorPathSegment}`;
 
 // AP objectのURLから、ブリッジ管理下のconcrnt保存先キーを決定的に導出する
 const inboxKey = (url: string) =>
@@ -243,7 +244,7 @@ federation.setNodeInfoDispatcher("/ap/nodeinfo/2.1", async (ctx) => {
 })
 
 federation
-    .setInboxListeners("/ap/acct/{identifier}/inbox", "/ap/inbox")
+    .setInboxListeners(`${actorPath}/{identifier}/inbox`, "/ap/inbox")
     .on(Follow, async (ctx, follow) => {
 
         const object = ctx.parseUri(follow.objectId);
@@ -796,7 +797,7 @@ export const buildPerson = async (ctx: Context<unknown>, identifier: string): Pr
 
 // id・inbox・publicKey等の必須プロパティはbuildPerson内で設定している(静的解析の誤検知)
 // eslint-disable-next-line @fedify/lint/actor-id-required
-federation.setActorDispatcher("/ap/acct/{identifier}", async (ctx, identifier) => {
+federation.setActorDispatcher(`${actorPath}/{identifier}`, async (ctx, identifier) => {
     if (identifier === INSTANCE_ACTOR) {
         const keys = await ctx.getActorKeyPairs(identifier);
         return new Application({
@@ -847,7 +848,7 @@ federation.setActorDispatcher("/ap/acct/{identifier}", async (ctx, identifier) =
 
 // Mastodon等のUI表示用の最小実装。投稿の列挙は今のところ提供しない。
 federation.setOutboxDispatcher(
-    "/ap/acct/{identifier}/outbox",
+    `${actorPath}/{identifier}/outbox`,
     async (ctx, identifier) => {
         const users = await db.select().from(apEntity).where(eq(apEntity.id, identifier)).limit(1);
         if (users.length === 0) return null;
@@ -856,7 +857,7 @@ federation.setOutboxDispatcher(
 );
 
 federation.setFollowersDispatcher(
-    "/ap/acct/{identifier}/followers",
+    `${actorPath}/{identifier}/followers`,
     async (ctx, identifier) => {
         const entity = await db.select().from(apEntity)
             .where(eq(apEntity.id, identifier)).limit(1).then(res => res[0]);
@@ -883,7 +884,7 @@ federation.setFollowersDispatcher(
 
 federation.setObjectDispatcher(
     Note,
-    "/ap/acct/{identifier}/posts/{+id}",
+    `${actorPath}/{identifier}/posts/{+id}`,
     async (ctx, values) => {
 
         const entity = await db.select().from(apEntity).where(eq(apEntity.id, values.identifier)).limit(1);
