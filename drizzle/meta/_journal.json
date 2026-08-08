@@ -15,6 +15,13 @@
       "when": 1785917007119,
       "tag": "0001_lean_the_santerians",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1786202117188,
+      "tag": "0002_dizzy_fabian_cortez",
+      "breakpoints": true
     }
   ]
 }
