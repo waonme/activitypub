@@ -1,5 +1,5 @@
 import { createFederation, exportJwk, generateCryptoKeyPair } from "@fedify/fedify";
-import { Person, Application, Follow, Endpoints, Accept, Reject, Undo, Note, type Recipient, Create, Like, Delete, Announce, EmojiReact, Emoji, Image, Update, Mention, type Actor } from "@fedify/vocab";
+import { Person, Application, Follow, Endpoints, Accept, Reject, Undo, Note, PUBLIC_COLLECTION, type Recipient, Create, Like, Delete, Announce, EmojiReact, Emoji, Image, Update, Mention, isActor, type Actor } from "@fedify/vocab";
 import type { Context } from "@fedify/fedify";
 import { getLogger } from "@logtape/logtape";
 import { RedisKvStore, RedisMessageQueue } from "@fedify/redis";
@@ -13,6 +13,7 @@ import concrntApi, { commit, importCommit } from "./concrnt.ts";
 import { config } from "./config.ts";
 import { SCHEMA_AP_NOTE, SCHEMA_REROUTE, SCHEMA_LIKE, SCHEMA_REACTION, SCHEMA_MENTION, SCHEMA_REPLY_ASSOCIATION, SCHEMA_DELETE, parseEmojiShortcode, renderMarkdownToHtml, buildNote } from "./convert.ts";
 import { SCHEMA_AP_FOLLOWER, SCHEMA_AP_ACCEPT_STATE, followerKey, acceptStateKey, type ApFollowerValue } from "./schemas.ts";
+import { selectCreateRecipientCcids } from "./inboundDelivery.ts";
 import * as followStore from "./followStore.ts";
 import * as objectCache from "./objectCache.ts";
 
@@ -470,8 +471,26 @@ federation
             }
         }
 
+        const actor = await create.getActor().catch(() => null);
+        const followersUri = actor?.followersId?.href ?? actorUri + "/followers";
         const followerCcids = followStore.getLocalFollowerCcids(actorUri);
-        if (followerCcids.length === 0 && mentionedEntities.length === 0 && replyTarget == null) {
+
+        // Public/unlisted and followers-only posts fan out to local followers.
+        // Direct posts must go only to explicitly addressed local actors (and
+        // an identified local reply target), otherwise their existence leaks
+        // into every follower's inbox even though resolve later hides content.
+        const explicitlyAddressedCcids = [
+            ...mentionedEntities.map(entity => entity.ccid),
+            ...(replyTarget != null ? [replyTarget.entity.ccid] : []),
+        ];
+        const recipientCcids = selectCreateRecipientCcids(
+            addressed,
+            followersUri,
+            followerCcids,
+            explicitlyAddressedCcids,
+        );
+
+        if (recipientCcids.length === 0) {
             logger.info(`Actor ${actorUri} has no followers, local mentions or reply target. Skipping Create activity.`);
             return;
         }
@@ -479,27 +498,23 @@ federation
         // 本文をキャッシュする。非publicノート(Misskeyのフォロワー限定等)は
         // リモートに再fetchできないため、生の宛先を保存して閲覧可否は
         // 読み出し時にisVisibleToで評価する
-        const actor = await create.getActor().catch(() => null);
         await objectCache.putObject(objectUri, {
             json: await objectCache.buildCacheJson(object, create),
             actorUri,
             addressed,
-            followersUri: actor?.followersId?.href,
+            followersUri,
+            recipientCcids,
             receivedAt: new Date().toISOString(),
         });
 
-        // フォロワーのinboxに加え、リプライ先ユーザー自身のinboxにも配送する
-        // (リプライ先がフォロワーでもある場合はSetで重複排除)
-        const noteTimelines = new Set(followerCcids.map(ccid => `cckv://${ccid}/activitypub.concrnt.world/inbox`));
-        if (replyTarget != null) {
-            noteTimelines.add(`cckv://${replyTarget.entity.ccid}/activitypub.concrnt.world/inbox`);
-        }
+        const noteTimelines = recipientCcids
+            .map(ccid => `cckv://${ccid}/activitypub.concrnt.world/inbox`);
 
         const noteKey = await storeApNote(
             objectUri,
             actorUri,
             object.published ? new Date(object.published.toString()) : new Date(),
-            [...noteTimelines],
+            noteTimelines,
         );
 
         // メンションされたユーザーへはnotify-timeline宛てのassociationで通知する。
@@ -565,6 +580,20 @@ federation
         }
 
         const noteActorURL = object.attributionId?.toString() ?? actorUri;
+        const noteActor = await object.getAttribution({ crossOrigin: 'trust' }).catch(() => null);
+        const addressed = [...object.toIds, ...object.ccIds].map(uri => uri.href);
+        const followersUri = noteActor && isActor(noteActor) ? noteActor.followersId?.href : undefined;
+
+        // Announce内側のNoteも受信時の本文を保存する。followers-onlyの
+        // ブースト元は後から再取得できないため、参照レコードだけでは表示不能になる。
+        await objectCache.putObject(noteURL, {
+            json: await objectCache.buildCacheJson(object, announce),
+            actorUri: noteActorURL,
+            addressed,
+            ...(followersUri ? { followersUri } : {}),
+            recipientCcids: followStore.getLocalFollowerCcids(noteActorURL),
+            receivedAt: new Date().toISOString(),
+        });
 
         // 内側のnoteは解決できればよいのでタイムラインへは配送しない。
         // ブースト元が古いとbackdate windowに掛かるためimport経路で実体化する

@@ -1,15 +1,20 @@
 import { Redis } from "ioredis";
 import { PUBLIC_COLLECTION, type Object as ApObject } from "@fedify/vocab";
+import { eq } from "drizzle-orm";
+import { getLogger } from "@logtape/logtape";
 import { config } from "./config.ts";
+import { apInboundObject, db, type ApInboundObjectRow } from "./db/index.ts";
+import { collectCachedAddresses } from "./inboundDelivery.ts";
 import * as followStore from "./followStore.ts";
 
-// inbox受信・resolve済みAPオブジェクトの本文キャッシュ。DBには保存しない純粋な
-// TTL付きキャッシュで、リモートへのfetch回数削減と即応答が目的。副次的に、
-// リモートが再fetchを許さないオブジェクト(Misskeyのフォロワー限定ノート等)も
-// TTLの間は表示できる。TTL切れ後に遡って取得不能になるのは仕様として許容する。
+// inbox受信・resolve済みAPオブジェクトの本文キャッシュ。Redisを高速経路とし、
+// 後から再fetchできないfollowers/directオブジェクトだけPostgresにも永続化する。
+// これによりキャッシュ期限切れ・pod再作成・旧snapshot実装からの更新をまたいでも
+// 正規の受信者は本文を表示できる。public/unlistedはリモート再取得可能なのでTTLのみ。
 
 const OBJECT_PREFIX = "apcache:object:";
 const ALIAS_PREFIX = "apcache:alias:";
+const logger = getLogger("activitypub");
 
 export interface CachedApObject {
     json: Record<string, unknown>;
@@ -18,6 +23,9 @@ export interface CachedApObject {
     addressed: string[];
     // 投稿者のfollowersコレクションURI(受信時にactorから取得できた場合)
     followersUri?: string;
+    // 永続fallbackで配送時の受信者を保持する。Redis上では認可の補助情報であり、
+    // 実際のfollowers判定はfollowStoreの現在状態も必須とする。
+    recipientCcids?: string[];
     receivedAt: string;
 }
 
@@ -38,6 +46,60 @@ export const isVisibleTo = (entry: CachedApObject, requester: { ccid: string; ac
 };
 
 const redis = new Redis(config.redis.url);
+
+const persistentRowToEntry = (row: ApInboundObjectRow): CachedApObject => {
+    const addressed = collectCachedAddresses(row.object);
+    const followersUri = addressed.find((uri) => uri.endsWith("/followers"));
+    return {
+        json: row.object,
+        actorUri: row.actorId,
+        addressed,
+        ...(followersUri ? { followersUri } : {}),
+        recipientCcids: row.recipientCcids,
+        receivedAt: row.updatedAt.toISOString(),
+    };
+};
+
+const persistRestrictedObject = async (uri: string, entry: CachedApObject): Promise<void> => {
+    if (entry.addressed.includes(PUBLIC_COLLECTION.href)) {
+        // An Update may widen a formerly restricted object. Do not leave a
+        // stale private snapshot that could reappear after the Redis TTL.
+        await db.delete(apInboundObject).where(eq(apInboundObject.objectId, uri));
+        return;
+    }
+
+    const existing = await db.select({
+        actorId: apInboundObject.actorId,
+        recipientCcids: apInboundObject.recipientCcids,
+    }).from(apInboundObject).where(eq(apInboundObject.objectId, uri)).limit(1).then(rows => rows[0]);
+    if (existing && existing.actorId !== entry.actorUri) {
+        logger.warn(`Inbound object actor mismatch for ${uri}: ${entry.actorUri} vs ${existing.actorId}`);
+        throw new Error(`Inbound object actor mismatch for ${uri}`);
+    }
+
+    const recipientCcids = [...new Set([
+        ...(existing?.recipientCcids ?? []),
+        ...(entry.recipientCcids ?? []),
+    ])];
+    const followersUri = entry.followersUri ?? entry.actorUri + "/followers";
+    const visibility = entry.addressed.includes(followersUri) ? "followers" : "direct";
+
+    await db.insert(apInboundObject).values({
+        objectId: uri,
+        actorId: entry.actorUri,
+        object: entry.json,
+        recipientCcids,
+        visibility,
+    }).onConflictDoUpdate({
+        target: apInboundObject.objectId,
+        set: {
+            object: entry.json,
+            recipientCcids,
+            visibility,
+            updatedAt: new Date(),
+        },
+    });
+};
 
 // fedifyのtoJsonLd()はvocab未知のプロパティを落とすため、受信時の生JSON-LDから
 // _misskey_*(MFMソース等)を拾い直してマージする。埋め込みオブジェクトは自身の
@@ -63,6 +125,7 @@ export const buildCacheJson = async (object: ApObject, activity?: ApObject): Pro
 };
 
 export const putObject = async (uri: string, entry: CachedApObject): Promise<void> => {
+    await persistRestrictedObject(uri, entry);
     await redis.set(OBJECT_PREFIX + uri, JSON.stringify(entry), "EX", config.activitypub.objectCacheTTL);
 };
 
@@ -73,18 +136,34 @@ export const putAlias = async (uri: string, canonicalUri: string): Promise<void>
 };
 
 export const getObject = async (uri: string): Promise<CachedApObject | null> => {
+    let objectUri = uri;
     let raw = await redis.get(OBJECT_PREFIX + uri);
     if (raw == null) {
         const canonical = await redis.get(ALIAS_PREFIX + uri);
-        if (canonical == null) return null;
-        raw = await redis.get(OBJECT_PREFIX + canonical);
+        if (canonical != null) {
+            objectUri = canonical;
+            raw = await redis.get(OBJECT_PREFIX + objectUri);
+        }
     }
-    if (raw == null) return null;
-    const entry = JSON.parse(raw) as CachedApObject;
-    if (!Array.isArray(entry.addressed)) return null; // 旧形状エントリはミス扱い
+    if (raw != null) {
+        const entry = JSON.parse(raw) as CachedApObject;
+        if (Array.isArray(entry.addressed)) return entry;
+    }
+
+    // Legacy deployments kept these snapshots only in Postgres. Reading on
+    // miss both preserves those deliveries and lazily warms the current cache.
+    const row = await db.select().from(apInboundObject)
+        .where(eq(apInboundObject.objectId, objectUri)).limit(1).then(rows => rows[0]);
+    if (!row) return null;
+
+    const entry = persistentRowToEntry(row);
+    await redis.set(OBJECT_PREFIX + objectUri, JSON.stringify(entry), "EX", config.activitypub.objectCacheTTL);
     return entry;
 };
 
 export const deleteObject = async (uri: string): Promise<void> => {
-    await redis.del(OBJECT_PREFIX + uri);
+    await Promise.all([
+        redis.del(OBJECT_PREFIX + uri),
+        db.delete(apInboundObject).where(eq(apInboundObject.objectId, uri)),
+    ]);
 };
