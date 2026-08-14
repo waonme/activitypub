@@ -7,12 +7,12 @@ import { Redis } from "ioredis";
 import { db, apEntity, apKeys, apObjectReference, type ApEntity } from './db/index.ts';
 import { importJwk } from "@fedify/fedify";
 import { eq, and } from "drizzle-orm";
-import { CDID, NotFoundError, type Document } from '@concrnt/client'
+import { CDID, NotFoundError, type Document, type SignedDocument } from '@concrnt/client'
 
 import concrntApi, { commit, importCommit } from "./concrnt.ts";
 import { config } from "./config.ts";
 import { SCHEMA_AP_NOTE, SCHEMA_REROUTE, SCHEMA_REFERENCE, SCHEMA_LIKE, SCHEMA_REACTION, SCHEMA_MENTION, SCHEMA_REPLY_ASSOCIATION, SCHEMA_DELETE, parseEmojiShortcode, renderMarkdownToHtml, buildNote, buildActivity } from "./convert.ts";
-import { SCHEMA_AP_FOLLOWER, SCHEMA_AP_ACCEPT_STATE, followerKey, acceptStateKey, type ApFollowerValue } from "./schemas.ts";
+import { SCHEMA_AP_FOLLOWER, SCHEMA_AP_ACCEPT_STATE, AP_NAMESPACE, followerKey, acceptStateKey, type ApFollowerValue } from "./schemas.ts";
 import * as followStore from "./followStore.ts";
 import * as settingsStore from "./settingsStore.ts";
 import * as objectCache from "./objectCache.ts";
@@ -848,15 +848,35 @@ federation.setActorDispatcher("/ap/acct/{identifier}", async (ctx, identifier) =
     return pairs;
 });
 
-// 過去投稿のページング付きoutbox。daemonのリアルタイム送出(handleOutboundCreate)と
-// 同じ対象基準・同じactivity idで、listen対象タイムラインの履歴を列挙する。
-// カーソルはISOタイムスタンプ「そのtimestampより厳密に古いitemから」、空文字=最新から。
-// 注: daemonはdocument.distributesとlisten timelineの前方一致で判定するのに対し、
-// こちらはlisten timelineの列挙なので、サフィックス付きURIがdistributesに載る
-// ケースのみ差が出る(実運用のdistributesはtimeline URIそのもののため許容)。
+// 過去投稿のページング付きoutbox。ソースはCIP-5 queryのparent(=listen対象
+// タイムライン直下の配布referenceの列挙)+authorフィルタ。配布referenceは
+// document-reference proofにより「referenceのauthor=参照先のauthor」が強制される
+// ため、author指定で本人投稿の配布行だけがサーバー側で絞れる(CIP-5 §3.1)。
+// 各referenceのvalue.hrefから元ドキュメントを解決してbuildActivityへ渡すので、
+// activity idは送出時と同一になる。
+// カーソルはサーバーのnextカーソル(limit+1方式・実効createdAt=参照先のcreatedAt)を
+// 無加工でエコーバックする(CIP-5 §3.3)。untilは境界包含で、境界の行はlimit+1件目
+// として前ページで未放出のため、取りこぼしも重複も発生しない。空文字=最新から。
+// 1ページで返す活動数の目標。これが埋まるまで読み進める
 const OUTBOX_PAGE_SIZE = 20;
-// フィルタで1件も残らないページが続いた場合に内部で読み進める上限
+// query1回のフェッチ幅(サーバー上限100)。authorで絞れている前提なので
+// PAGE_SIZE+削除済み等で落ちる分の余裕があれば足りる
+const OUTBOX_FETCH_LIMIT = 30;
+// 対象外の行が支配的な区間(author未対応の旧サーバー等)でページが
+// 埋まらなくても打ち切る読み進め上限
 const OUTBOX_MAX_SCAN_ROUNDS = 5;
+
+// RFC3339タイムスタンプをns精度のepochに変換する(パース不能ならnull)。
+// サーバーのカーソル/ソートキーはμ秒以上の精度を持ちうるため、
+// ms丸め(Date.parse単体)で比較すると境界の取りこぼし・重複が起こる
+const epochNs = (iso: string): bigint | null => {
+    const m = /^(.+?)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$/.exec(iso);
+    if (!m) return null;
+    const baseMs = Date.parse(m[1] + m[3]);
+    if (Number.isNaN(baseMs)) return null;
+    const frac = (m[2] ?? '').padEnd(9, '0').slice(0, 9);
+    return BigInt(baseMs) * 1_000_000n + BigInt(frac || '0');
+};
 
 federation.setOutboxDispatcher(
     "/ap/acct/{identifier}/outbox",
@@ -865,11 +885,7 @@ federation.setOutboxDispatcher(
             .where(eq(apEntity.id, identifier)).limit(1).then(res => res[0]);
         if (!entity) return null;
 
-        let untilMs: number | undefined;
-        if (cursor) {
-            untilMs = Date.parse(cursor);
-            if (Number.isNaN(untilMs)) return null;
-        }
+        if (cursor && Number.isNaN(Date.parse(cursor))) return null;
 
         // 新規entityがdaemonの60秒周期ロードより先に読まれた場合に備える(ロード済みならno-op)
         await settingsStore.ensureEntitySettingsLoaded(entity.ccid).catch(() => {});
@@ -880,52 +896,82 @@ federation.setOutboxDispatcher(
 
         const activities: Activity[] = [];
         const seen = new Set<string>();
+        let until = cursor || undefined;
         let nextCursor: string | null = null;
 
-        for (let round = 0; round < OUTBOX_MAX_SCAN_ROUNDS; round++) {
-            const cutoffMs = untilMs;
-            const raw = await concrntApi.getTimelineRanged(timelines, {
-                until: cutoffMs != null ? new Date(cutoffMs) : undefined,
-                limit: OUTBOX_PAGE_SIZE,
-            });
-            // untilは境界包含・チャンク単位の重複がありうるため厳密に切る
-            const items = cutoffMs != null
-                ? raw.filter(item => item.timestamp.getTime() < cutoffMs)
-                : raw;
+        for (let round = 0; round < OUTBOX_MAX_SCAN_ROUNDS && activities.length < OUTBOX_PAGE_SIZE; round++) {
+            const refs: { href: string, schema?: string, keyNs: bigint }[] = [];
+            let boundary: { ns: bigint, cursor: string } | null = null;
 
-            for (const item of items) {
-                if (!item.href || seen.has(item.href)) continue;
-                seen.add(item.href);
-                // コミュニティタイムライン等に混ざる他人のレコードはフェッチ前に排除する
-                if (URL.parse(item.href)?.host !== entity.ccid) continue;
+            for (const timeline of timelines) {
+                const params: Record<string, string> = {
+                    parent: timeline,
+                    author: entity.ccid,
+                    limit: String(OUTBOX_FETCH_LIMIT),
+                    order: 'desc',
+                };
+                if (until != null) params.until = until;
+                const page = await concrntApi.requestConcrntApi<{ items: SignedDocument[], next: string | null }>(
+                    config.concrnt.domain, 'net.concrnt.core.query', params);
 
-                const document = await concrntApi.getDocument<any>(item.href, undefined, { negativeTTL: 300_000 })
+                for (const sd of page.items) {
+                    let refDoc: any;
+                    try { refDoc = JSON.parse(sd.document); } catch { continue; }
+                    const href: string | undefined = refDoc.value?.href;
+                    if (!href || seen.has(href)) continue; // 複数timeline重複のdedupe
+                    seen.add(href);
+                    // サーバーのソートキーと同じ導出: 参照先のcreatedAt、無ければreference自身
+                    const keyNs = epochNs(refDoc.value?.createdAt ?? refDoc.createdAt ?? '');
+                    if (keyNs == null) continue;
+                    refs.push({ href, schema: refDoc.value?.schema, keyNs });
+                }
+                if (page.next != null) {
+                    const ns = epochNs(page.next);
+                    if (ns != null && (boundary == null || ns > boundary.ns)) {
+                        boundary = { ns, cursor: page.next };
+                    }
+                }
+            }
+
+            // 未取得区間が残るtimelineがある場合、全timelineで網羅済みの
+            // 「境界より厳密に新しい」行だけを今回のページに載せる。境界タイと
+            // 保留分はuntil境界包含により次ページで必ず返る
+            const b = boundary;
+            const emittable = b != null ? refs.filter(r => r.keyNs > b.ns) : refs;
+            emittable.sort((x, y) => (x.keyNs < y.keyNs ? 1 : x.keyNs > y.keyNs ? -1 : 0));
+
+            for (const ref of emittable) {
+                // author未対応の旧サーバーでは受信リモートノートのreference等が混ざるため、
+                // hrefのcckvホストとブリッジ名前空間でフェッチ前に遮断する
+                if (URL.parse(ref.href)?.host !== entity.ccid) continue;
+                if (ref.href.startsWith(`cckv://${entity.ccid}/${AP_NAMESPACE}/`)) continue;
+                if (ref.schema === SCHEMA_REFERENCE) continue;
+
+                const document = await concrntApi.getDocument<any>(ref.href, undefined, { negativeTTL: 300_000 })
                     .catch(() => null);
                 if (document == null) continue; // 削除済み・取得失敗
                 // daemon側のfederate対象判定と同一基準
                 if (document.author !== entity.ccid || document.kind !== 'record') continue;
                 if (document.schema === SCHEMA_REFERENCE) continue;
 
-                const activity = await buildActivity(ctx, { identifier, id: document.key ?? item.href }, document)
+                const activity = await buildActivity(ctx, { identifier, id: document.key ?? ref.href }, document)
                     .catch(() => null);
                 if (activity == null) continue; // Note化不能・Announce先解決不能
                 activities.push(activity);
             }
 
-            if (raw.length < OUTBOX_PAGE_SIZE) {
-                // タイムライン終端
+            if (boundary == null) {
+                // 全timeline終端
                 nextCursor = null;
                 break;
             }
-            const oldestMs = items.length > 0 ? items[items.length - 1].timestamp.getTime() : NaN;
-            if (Number.isNaN(oldestMs) || (cutoffMs != null && oldestMs >= cutoffMs)) {
-                // カーソルが進まない(同時刻詰まり)場合はここで打ち切る
+            if (boundary.cursor === until) {
+                // カーソルが進まない場合は打ち切る(CIP-5 §3.3)
                 nextCursor = null;
                 break;
             }
-            nextCursor = new Date(oldestMs).toISOString();
-            if (activities.length > 0) break;
-            untilMs = oldestMs; // フィルタで全滅したページは内部で読み進める
+            nextCursor = boundary.cursor;
+            until = boundary.cursor;
         }
 
         return { items: activities, nextCursor };
