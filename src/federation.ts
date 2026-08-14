@@ -1,5 +1,5 @@
 import { createFederation, exportJwk, generateCryptoKeyPair } from "@fedify/fedify";
-import { Person, Application, Follow, Endpoints, Accept, Reject, Undo, Note, type Recipient, Create, Like, Delete, Announce, EmojiReact, Emoji, Image, Update, Mention, type Actor } from "@fedify/vocab";
+import { Person, Application, Follow, Endpoints, Accept, Reject, Undo, Note, type Recipient, Activity, Create, Like, Delete, Announce, EmojiReact, Emoji, Image, Update, Mention, type Actor } from "@fedify/vocab";
 import type { Context } from "@fedify/fedify";
 import { getLogger } from "@logtape/logtape";
 import { RedisKvStore, RedisMessageQueue } from "@fedify/redis";
@@ -11,9 +11,10 @@ import { CDID, NotFoundError, type Document } from '@concrnt/client'
 
 import concrntApi, { commit, importCommit } from "./concrnt.ts";
 import { config } from "./config.ts";
-import { SCHEMA_AP_NOTE, SCHEMA_REROUTE, SCHEMA_LIKE, SCHEMA_REACTION, SCHEMA_MENTION, SCHEMA_REPLY_ASSOCIATION, SCHEMA_DELETE, parseEmojiShortcode, renderMarkdownToHtml, buildNote } from "./convert.ts";
+import { SCHEMA_AP_NOTE, SCHEMA_REROUTE, SCHEMA_REFERENCE, SCHEMA_LIKE, SCHEMA_REACTION, SCHEMA_MENTION, SCHEMA_REPLY_ASSOCIATION, SCHEMA_DELETE, parseEmojiShortcode, renderMarkdownToHtml, buildNote, buildActivity } from "./convert.ts";
 import { SCHEMA_AP_FOLLOWER, SCHEMA_AP_ACCEPT_STATE, followerKey, acceptStateKey, type ApFollowerValue } from "./schemas.ts";
 import * as followStore from "./followStore.ts";
+import * as settingsStore from "./settingsStore.ts";
 import * as objectCache from "./objectCache.ts";
 
 const logger = getLogger("activitypub");
@@ -847,15 +848,96 @@ federation.setActorDispatcher("/ap/acct/{identifier}", async (ctx, identifier) =
     return pairs;
 });
 
-// Mastodon等のUI表示用の最小実装。投稿の列挙は今のところ提供しない。
+// 過去投稿のページング付きoutbox。daemonのリアルタイム送出(handleOutboundCreate)と
+// 同じ対象基準・同じactivity idで、listen対象タイムラインの履歴を列挙する。
+// カーソルはISOタイムスタンプ「そのtimestampより厳密に古いitemから」、空文字=最新から。
+// 注: daemonはdocument.distributesとlisten timelineの前方一致で判定するのに対し、
+// こちらはlisten timelineの列挙なので、サフィックス付きURIがdistributesに載る
+// ケースのみ差が出る(実運用のdistributesはtimeline URIそのもののため許容)。
+const OUTBOX_PAGE_SIZE = 20;
+// フィルタで1件も残らないページが続いた場合に内部で読み進める上限
+const OUTBOX_MAX_SCAN_ROUNDS = 5;
+
 federation.setOutboxDispatcher(
     "/ap/acct/{identifier}/outbox",
-    async (ctx, identifier) => {
-        const users = await db.select().from(apEntity).where(eq(apEntity.id, identifier)).limit(1);
-        if (users.length === 0) return null;
-        return { items: [] };
+    async (ctx, identifier, cursor) => {
+        const entity = await db.select().from(apEntity)
+            .where(eq(apEntity.id, identifier)).limit(1).then(res => res[0]);
+        if (!entity) return null;
+
+        let untilMs: number | undefined;
+        if (cursor) {
+            untilMs = Date.parse(cursor);
+            if (Number.isNaN(untilMs)) return null;
+        }
+
+        // 新規entityがdaemonの60秒周期ロードより先に読まれた場合に備える(ロード済みならno-op)
+        await settingsStore.ensureEntitySettingsLoaded(entity.ccid).catch(() => {});
+        const listenTimelines = settingsStore.getListenTimelines(entity.ccid);
+        const timelines = listenTimelines.length > 0
+            ? listenTimelines
+            : [`cckv://${entity.ccid}/concrnt.world/profiles/main/home-timeline`];
+
+        const activities: Activity[] = [];
+        const seen = new Set<string>();
+        let nextCursor: string | null = null;
+
+        for (let round = 0; round < OUTBOX_MAX_SCAN_ROUNDS; round++) {
+            const cutoffMs = untilMs;
+            const raw = await concrntApi.getTimelineRanged(timelines, {
+                until: cutoffMs != null ? new Date(cutoffMs) : undefined,
+                limit: OUTBOX_PAGE_SIZE,
+            });
+            // untilは境界包含・チャンク単位の重複がありうるため厳密に切る
+            const items = cutoffMs != null
+                ? raw.filter(item => item.timestamp.getTime() < cutoffMs)
+                : raw;
+
+            for (const item of items) {
+                if (!item.href || seen.has(item.href)) continue;
+                seen.add(item.href);
+                // コミュニティタイムライン等に混ざる他人のレコードはフェッチ前に排除する
+                if (URL.parse(item.href)?.host !== entity.ccid) continue;
+
+                const document = await concrntApi.getDocument<any>(item.href, undefined, { negativeTTL: 300_000 })
+                    .catch(() => null);
+                if (document == null) continue; // 削除済み・取得失敗
+                // daemon側のfederate対象判定と同一基準
+                if (document.author !== entity.ccid || document.kind !== 'record') continue;
+                if (document.schema === SCHEMA_REFERENCE) continue;
+
+                const activity = await buildActivity(ctx, { identifier, id: document.key ?? item.href }, document)
+                    .catch(() => null);
+                if (activity == null) continue; // Note化不能・Announce先解決不能
+                activities.push(activity);
+            }
+
+            if (raw.length < OUTBOX_PAGE_SIZE) {
+                // タイムライン終端
+                nextCursor = null;
+                break;
+            }
+            const oldestMs = items.length > 0 ? items[items.length - 1].timestamp.getTime() : NaN;
+            if (Number.isNaN(oldestMs) || (cutoffMs != null && oldestMs >= cutoffMs)) {
+                // カーソルが進まない(同時刻詰まり)場合はここで打ち切る
+                nextCursor = null;
+                break;
+            }
+            nextCursor = new Date(oldestMs).toISOString();
+            if (activities.length > 0) break;
+            untilMs = oldestMs; // フィルタで全滅したページは内部で読み進める
+        }
+
+        return { items: activities, nextCursor };
     },
-);
+).setFirstCursor(async (ctx, identifier) => {
+    // firstCursor設定時、コレクション本体のGETではdispatcherが呼ばれないため、
+    // ここでentity存在を確認する。不在時はnull → fedifyが非ページ経路で
+    // dispatcher(cursor=null)を呼び、そちらのentityチェックで404になる。
+    const exists = await db.select().from(apEntity)
+        .where(eq(apEntity.id, identifier)).limit(1).then(res => res.length > 0);
+    return exists ? "" : null;
+});
 
 federation.setFollowersDispatcher(
     "/ap/acct/{identifier}/followers",

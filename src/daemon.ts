@@ -2,14 +2,14 @@ import { db, apEntity, apObjectReference, type ApEntity } from './db/index.ts';
 import { Redis } from "ioredis";
 import { and, eq } from "drizzle-orm";
 import fedi, { buildPerson } from "./federation.ts";
-import { Announce, Create, Delete, Emoji, Follow, Image, isActor, Like, Note, PUBLIC_COLLECTION, Tombstone, Undo, Update } from '@fedify/vocab';
+import { Announce, Delete, Emoji, Follow, Image, isActor, Like, Note, PUBLIC_COLLECTION, Tombstone, Undo, Update } from '@fedify/vocab';
 
 import { getLogger } from "@logtape/logtape";
 import { type Document } from "@concrnt/client";
 
 import concrntApi, { commit } from "./concrnt.ts";
 import { config } from "./config.ts";
-import { buildNote, isPlainReroute, resolveApObjectUrl, SCHEMA_AP_NOTE, SCHEMA_REFERENCE, SCHEMA_LIKE, SCHEMA_REACTION, SCHEMA_DELETE } from "./convert.ts";
+import { buildActivity, SCHEMA_AP_NOTE, SCHEMA_REFERENCE, SCHEMA_LIKE, SCHEMA_REACTION, SCHEMA_DELETE } from "./convert.ts";
 import { SCHEMA_AP_FOLLOW, SCHEMA_AP_FOLLOWER, SCHEMA_AP_ACCEPT_STATE, AP_NAMESPACE, acceptStateKey, settingsKey, type ApFollowerValue, type ApAcceptStateValue } from "./schemas.ts";
 import * as followStore from "./followStore.ts";
 import * as settingsStore from "./settingsStore.ts";
@@ -105,69 +105,35 @@ const handleOutboundCreate = async (entity: ApEntity, cckv: string, document: an
     const baseURL = new URL(config.activitypub.baseUrl);
     const ctx = fedi.createContext(baseURL, undefined);
 
-    if (isPlainReroute(document)) {
-        // テキストなしreroute → Announce (boost)
-        const targetURI: string | undefined = document.value?.targetURI;
-        if (!targetURI) return;
+    // 手元のdocumentから直接アクティビティを構築する(自己HTTP経由の再取得を避ける)。
+    const activity = await buildActivity(ctx, { identifier: entity.id, id: cckv }, document);
+    if (activity == null) {
+        logger.info(`Document does not resolve to an AP activity, skipping: ${cckv}`);
+        return;
+    }
 
-        const objectRef = await resolveApObjectUrl(ctx, targetURI);
-        if (!objectRef) {
-            logger.info(`Reroute target is not resolvable to an AP object, skipping: ${targetURI}`);
-            return;
-        }
+    await ctx.sendActivity(
+        { identifier: entity.id },
+        "followers",
+        activity,
+    );
 
-        const announceId = new URL(`${config.activitypub.baseUrl}/ap/announces/${encodeURIComponent(cckv)}`);
-
-        await ctx.sendActivity(
-            { identifier: entity.id },
-            "followers",
-            new Announce({
-                id: announceId,
-                actor: ctx.getActorUri(entity.id),
-                object: new URL(objectRef),
-                tos: [PUBLIC_COLLECTION],
-                ccs: [ctx.getFollowersUri(entity.id)],
-            }),
-        );
-
+    if (activity instanceof Announce) {
         // unboost時にUndo(Announce)を送るための対応を記録
         await db.insert(apObjectReference).values({
-            apObjectId: announceId.href,
+            apObjectId: activity.id!.href,
             ccUri: cckv,
             refType: 'outbound-announce',
-            meta: { object: objectRef },
+            meta: { object: activity.objectId!.href },
         }).onConflictDoNothing();
 
         return;
     }
 
-    // 通常投稿・引用reroute → Create(Note)。
-    // 手元のdocumentから直接Noteを構築する(自己HTTP経由の再取得を避ける)。
-    const noteArgs = { identifier: entity.id, id: cckv };
-    const note = await buildNote(ctx, noteArgs, document);
-    if (note == null) {
-        logger.info(`Document does not resolve to a Note, skipping: ${cckv}`);
-        return;
-    }
-
-    const createActivity = new Create({
-        id: new URL("#activity", note.id ?? undefined),
-        object: note,
-        actors: note.attributionIds,
-        tos: note.toIds,
-        ccs: note.ccIds,
-    });
-
-    await ctx.sendActivity(
-        { identifier: entity.id },
-        "followers",
-        createActivity,
-    );
-
     // deletedイベントはdistributesを運ばず監視設定と突合できないため、
     // 送信済みNoteを記録しておき、削除時はこの対応表で判定する
     await db.insert(apObjectReference).values({
-        apObjectId: ctx.getObjectUri(Note, noteArgs).href,
+        apObjectId: ctx.getObjectUri(Note, { identifier: entity.id, id: cckv }).href,
         ccUri: cckv,
         refType: 'outbound-note',
     }).onConflictDoNothing();
@@ -177,7 +143,7 @@ const handleOutboundCreate = async (entity: ApEntity, cckv: string, document: an
     const followersUri = ctx.getFollowersUri(entity.id).href;
     const documentLoader = await ctx.getDocumentLoader({ identifier: entity.id });
     const extraRecipients = (await Promise.all(
-        note.ccIds
+        activity.ccIds
             .filter(cc => cc.href !== PUBLIC_COLLECTION.href && cc.href !== followersUri)
             .map(cc => ctx.lookupObject(cc.href, { documentLoader }).catch(() => null))
     )).filter(isActor);
@@ -185,7 +151,7 @@ const handleOutboundCreate = async (entity: ApEntity, cckv: string, document: an
         await ctx.sendActivity(
             { identifier: entity.id },
             extraRecipients,
-            createActivity,
+            activity,
             // ローカル同士のメンションがAPブリッジ経由で二重通知されるのを防ぐ
             { excludeBaseUris: [baseURL] },
         );
