@@ -1,5 +1,7 @@
 server:
   port: 8008
+  # /-/ 配下の運用者APIを有効化するBearer token。未設定時は運用者APIを無効化
+  # adminToken: replace-with-a-long-random-token
 
 database:
   url: postgres://postgres:postgres@localhost:5432/postgres

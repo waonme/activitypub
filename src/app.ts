@@ -75,7 +75,17 @@ app.get("/health", (c) => c.json({ status: "ok" }));
 // body: { ccid?: string, actorURIs?: string[], dryRun?: boolean }
 //   ccid省略=全enabledエンティティ / actorURIs指定=そのアクターのみ
 app.post("/-/resend-follows", async (c) => {
+    const adminToken = config.server.adminToken;
+    if (adminToken == null) {
+        return c.json({ error: "Operator API is disabled" }, 404);
+    }
+    if (c.req.header("authorization") !== `Bearer ${adminToken}`) {
+        return c.json({ error: "Unauthorized" }, 401);
+    }
     const body = await c.req.json().catch(() => ({})) as { ccid?: string, actorURIs?: string[], dryRun?: boolean };
+    if (body.ccid !== undefined && body.ccid.trim() === "") {
+        return c.json({ error: "ccid must be a non-empty string when provided" }, 400);
+    }
     const results = await resendPendingFollows(body);
     const count = (s: string) => results.filter((r) => r.status === s).length;
     return c.json({ sent: count('sent'), failed: count('failed'), skipped: count('skipped'), results });

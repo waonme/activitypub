@@ -399,6 +399,9 @@ const followActivityId = (recordKey: string) =>
 export interface ResendFollowResult { ccid: string, actorURI: string, status: 'sent' | 'failed' | 'skipped', reason?: string }
 
 export const resendPendingFollows = async (opts: { ccid?: string, actorURIs?: string[], dryRun?: boolean }): Promise<ResendFollowResult[]> => {
+    if (opts.ccid !== undefined && opts.ccid.trim() === '') {
+        throw new TypeError('ccid must be a non-empty string when provided');
+    }
     const ctx = fedi.createContext(new URL(config.activitypub.baseUrl), undefined);
     // propertyが無い時だけ全pendingを対象にする。明示された空配列は「対象なし」。
     const wanted = opts.actorURIs === undefined ? null : new Set(opts.actorURIs);

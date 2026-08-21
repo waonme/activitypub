@@ -7,6 +7,8 @@ import { parse } from "yaml";
 export interface AppConfig {
   server: {
     port: number;
+    // operator-only endpoints are disabled when omitted
+    adminToken: string | null;
   };
   database: {
     url: string;
@@ -152,6 +154,9 @@ const readConfig = (): AppConfig => {
   const config: AppConfig = {
     server: {
       port: expectNumber(server.port, "server.port"),
+      adminToken: server.adminToken === undefined
+        ? null
+        : expectString(server.adminToken, "server.adminToken"),
     },
     database: {
       url: expectString(database.url, "database.url"),
