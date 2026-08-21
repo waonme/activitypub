@@ -1182,7 +1182,7 @@ federation.setOutboxDispatcher(
                     ref.keyNs < resumeNs || (ref.keyNs === resumeNs && ref.href > afterHref!));
             }
             refs.sort((x, y) =>
-                x.keyNs < y.keyNs ? 1 : x.keyNs > y.keyNs ? -1 : x.href.localeCompare(y.href));
+                x.keyNs < y.keyNs ? 1 : x.keyNs > y.keyNs ? -1 : x.href < y.href ? -1 : x.href > y.href ? 1 : 0);
             const candidates = stalled ? refs : b != null ? refs.filter(r => r.keyNs > b.ns) : refs;
             const start = stalled ? Math.min(legacyTieOffset, candidates.length) : 0;
             const capacity = OUTBOX_PAGE_SIZE - activities.length;
