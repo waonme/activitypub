@@ -931,6 +931,9 @@ federation.setOutboxDispatcher(
 
         for (let round = 0; round < OUTBOX_MAX_SCAN_ROUNDS && activities.length < OUTBOX_PAGE_SIZE; round++) {
             const refs: { href: string, schema?: string, keyNs: bigint }[] = [];
+            // 同じround内の複数timelineだけを重複排除する。境界以下で次roundへ
+            // 保留した参照は、inclusive cursorで再取得できるようglobalなseenへ入れない。
+            const roundSeen = new Set<string>();
             let boundary: { ns: bigint, cursor: string } | null = null;
 
             for (const timeline of timelines) {
@@ -948,8 +951,8 @@ federation.setOutboxDispatcher(
                     let refDoc: any;
                     try { refDoc = JSON.parse(sd.document); } catch { continue; }
                     const href: string | undefined = refDoc.value?.href;
-                    if (!href || seen.has(href)) continue; // 複数timeline重複のdedupe
-                    seen.add(href);
+                    if (!href || seen.has(href) || roundSeen.has(href)) continue;
+                    roundSeen.add(href);
                     // サーバーのソートキーと同じ導出: 参照先のcreatedAt、無ければreference自身
                     const keyNs = epochNs(refDoc.value?.createdAt ?? refDoc.createdAt ?? '');
                     if (keyNs == null) continue;
@@ -988,6 +991,7 @@ federation.setOutboxDispatcher(
                     .catch(() => null);
                 if (activity == null) continue; // Note化不能・Announce先解決不能
                 activities.push(activity);
+                seen.add(ref.href);
             }
 
             if (boundary == null) {

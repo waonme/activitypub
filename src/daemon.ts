@@ -400,7 +400,8 @@ export interface ResendFollowResult { ccid: string, actorURI: string, status: 's
 
 export const resendPendingFollows = async (opts: { ccid?: string, actorURIs?: string[], dryRun?: boolean }): Promise<ResendFollowResult[]> => {
     const ctx = fedi.createContext(new URL(config.activitypub.baseUrl), undefined);
-    const wanted = opts.actorURIs?.length ? new Set(opts.actorURIs) : null;
+    // propertyが無い時だけ全pendingを対象にする。明示された空配列は「対象なし」。
+    const wanted = opts.actorURIs === undefined ? null : new Set(opts.actorURIs);
 
     let entities = await db.select().from(apEntity).where(eq(apEntity.enabled, true));
     if (opts.ccid) entities = entities.filter((e) => e.ccid === opts.ccid);
