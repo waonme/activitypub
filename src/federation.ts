@@ -895,6 +895,7 @@ const OUTBOX_FETCH_LIMIT = 30;
 // 対象外の行が支配的な区間(author未対応の旧サーバー等)でページが
 // 埋まらなくても打ち切る読み進め上限
 const OUTBOX_MAX_SCAN_ROUNDS = 5;
+const SCHEMA_USER_TIMELINE = "https://schema.concrnt.world/t/user.json";
 const SCHEMA_COMMUNITY_TIMELINE = "https://schema.concrnt.world/t/community.json";
 
 // RFC3339タイムスタンプをns精度のepochに変換する(パース不能ならnull)。
@@ -976,35 +977,38 @@ const fetchExactTiedOutboxRefs = async (timeline: string, author: string, cursor
 
 const listTimelineRoots = async (listenPrefix: string, author: string): Promise<string[]> => {
     const roots = new Set<string>();
-    const visitedCursors = new Set<string>();
-    let until: string | undefined;
+    for (const schema of [SCHEMA_USER_TIMELINE, SCHEMA_COMMUNITY_TIMELINE]) {
+        const visitedCursors = new Set<string>();
+        let until: string | undefined;
 
-    for (;;) {
-        const params: Record<string, string> = {
-            prefix: listenPrefix,
-            schema: SCHEMA_COMMUNITY_TIMELINE,
-            author,
-            limit: '100',
-            order: 'desc',
-        };
-        if (until != null) params.until = until;
-        const page = await concrntApi.requestConcrntApi<{ items: SignedDocument[], next: string | null }>(
-            config.concrnt.domain,
-            'net.concrnt.core.query',
-            params,
-        );
-        for (const sd of page.items) {
-            if (sd.cckv?.startsWith(listenPrefix)) roots.add(sd.cckv.replace(/\/$/, ''));
+        for (;;) {
+            const params: Record<string, string> = {
+                prefix: listenPrefix,
+                schema,
+                author,
+                limit: '100',
+                order: 'desc',
+            };
+            if (until != null) params.until = until;
+            const page = await concrntApi.requestConcrntApi<{ items: SignedDocument[], next: string | null }>(
+                config.concrnt.domain,
+                'net.concrnt.core.query',
+                params,
+            );
+            for (const sd of page.items) {
+                if (sd.cckv?.startsWith(listenPrefix)) roots.add(sd.cckv.replace(/\/$/, ''));
+            }
+            if (page.next == null) break;
+            // timeline定義自体が100件超で同一時刻の場合、完全列挙できないCore cursorを
+            // 進めて投稿を落とすよりoutboxを失敗させ、再試行可能な状態を保つ。
+            if (visitedCursors.has(page.next)) {
+                throw new Error(`cannot enumerate tied timeline roots below ${listenPrefix}`);
+            }
+            visitedCursors.add(page.next);
+            until = page.next;
         }
-        if (page.next == null) return [...roots];
-        // timeline定義自体が100件超で同一時刻の場合、完全列挙できないCore cursorを
-        // 進めて投稿を落とすよりoutboxを失敗させ、再試行可能な状態を保つ。
-        if (visitedCursors.has(page.next)) {
-            throw new Error(`cannot enumerate tied timeline roots below ${listenPrefix}`);
-        }
-        visitedCursors.add(page.next);
-        until = page.next;
     }
+    return [...roots];
 };
 
 // listenTimelinesは個別timelineだけでなく親prefixも許す。まず同時刻のprefix検索から
