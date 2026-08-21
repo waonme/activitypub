@@ -924,11 +924,26 @@ const isHashCDID = (value: string): boolean =>
 
 interface OutboxRef { href: string, schema?: string, keyNs: bigint }
 
+const parseOutboxRef = (sd: SignedDocument): OutboxRef | null => {
+    let refDoc: any;
+    try { refDoc = JSON.parse(sd.document); } catch { return null; }
+    const href: string | undefined = refDoc.value?.href;
+    const keyNs = epochNs(refDoc.value?.createdAt ?? refDoc.createdAt ?? '');
+    return href && keyNs != null ? { href, schema: refDoc.value?.schema, keyNs } : null;
+};
+
+const referenceParent = (key: string | undefined, listenPrefix: string): string | null => {
+    if (!key || !key.startsWith(listenPrefix)) return null;
+    const slash = key.lastIndexOf('/');
+    if (slash < 0 || !isHashCDID(key.slice(slash + 1))) return null;
+    return key.slice(0, slash);
+};
+
 // Core queryのtimestamp cursorは同一時刻内のdocument idを表現できない。
 // limitを超える同時刻行では同じcursorが返り続けるため、その時刻だけhash-CDIDの
 // key prefixを再帰分割して全行を回収する。配布referenceはCIP-7によりx+24文字の
 // hash-CDIDへ正規化されているので、各leafは一意になり必ず収束する。
-const fetchTiedOutboxRefs = async (timeline: string, author: string, cursor: string): Promise<OutboxRef[]> => {
+const fetchExactTiedOutboxRefs = async (timeline: string, author: string, cursor: string): Promise<OutboxRef[]> => {
     const directPrefix = `${timeline.replace(/\/$/, '')}/`;
     const prefixes = [`${directPrefix}x`];
     const refs: OutboxRef[] = [];
@@ -950,15 +965,50 @@ const fetchTiedOutboxRefs = async (timeline: string, author: string, cursor: str
             const key = sd.cckv;
             const suffix = key?.startsWith(directPrefix) ? key.slice(directPrefix.length) : '';
             if (!isHashCDID(suffix)) continue;
-            let refDoc: any;
-            try { refDoc = JSON.parse(sd.document); } catch { continue; }
-            const href: string | undefined = refDoc.value?.href;
-            const keyNs = epochNs(refDoc.value?.createdAt ?? refDoc.createdAt ?? '');
-            if (href && keyNs != null) refs.push({ href, schema: refDoc.value?.schema, keyNs });
+            const ref = parseOutboxRef(sd);
+            if (ref) refs.push(ref);
         }
     }
 
     return refs;
+};
+
+// listenTimelinesは個別timelineだけでなく親prefixも許す。まず同時刻のprefix検索から
+// 実際のreference親を列挙し、100件を超える場合は参照先recordのdistributesも使って
+// 同じ投稿に属する未取得の親を補完してから、各hash-CDID空間を個別に分割する。
+const fetchTiedOutboxRefs = async (listenPrefix: string, author: string, cursor: string): Promise<OutboxRef[]> => {
+    const page = await concrntApi.requestConcrntApi<{ items: SignedDocument[], next: string | null }>(
+        config.concrnt.domain,
+        'net.concrnt.core.query',
+        { prefix: listenPrefix, author, since: cursor, until: cursor, limit: '100', order: 'desc' },
+    );
+    const refs = page.items.map(parseOutboxRef).filter((ref): ref is OutboxRef => ref != null);
+    if (page.next == null) return refs;
+
+    const timelines = new Set<string>();
+    for (const sd of page.items) {
+        const parent = referenceParent(sd.cckv, listenPrefix);
+        if (parent) timelines.add(parent);
+    }
+
+    // 同一投稿のreference群はcreatedAtも同じなので、取得済みhrefから元recordを解決すれば
+    // そのdistributesに含まれる他の子timelineも列挙できる。
+    await Promise.all(refs.map(async (ref) => {
+        const document = await concrntApi.getDocument<any>(ref.href, undefined, { negativeTTL: 300_000 })
+            .catch(() => null);
+        const distributes: unknown = document?.distributes;
+        if (!Array.isArray(distributes)) return;
+        for (const destination of distributes) {
+            if (typeof destination === 'string' && destination.startsWith(listenPrefix)) {
+                timelines.add(destination.replace(/\/$/, ''));
+            }
+        }
+    }));
+
+    if (timelines.size === 0) return refs;
+    return (await Promise.all(
+        [...timelines].map((timeline) => fetchExactTiedOutboxRefs(timeline, author, cursor))
+    )).flat();
 };
 
 federation.setOutboxDispatcher(
