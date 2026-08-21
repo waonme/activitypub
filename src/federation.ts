@@ -908,6 +908,53 @@ const epochNs = (iso: string): bigint | null => {
     return BigInt(baseMs) * 1_000_000n + BigInt(frac || '0');
 };
 
+const epochNsToIso = (ns: bigint): string => {
+    const seconds = ns / 1_000_000_000n;
+    const fraction = (ns % 1_000_000_000n).toString().padStart(9, '0');
+    return `${new Date(Number(seconds * 1_000n)).toISOString().slice(0, 19)}.${fraction}Z`;
+};
+
+const CDID_ALPHABET = "0123456789abcdefghjkmnpqrstuvwyz";
+
+interface OutboxRef { href: string, schema?: string, keyNs: bigint }
+
+// Core queryのtimestamp cursorは同一時刻内のdocument idを表現できない。
+// limitを超える同時刻行では同じcursorが返り続けるため、その時刻だけhash-CDIDの
+// key prefixを再帰分割して全行を回収する。配布referenceはCIP-7によりx+24文字の
+// hash-CDIDへ正規化されているので、各leafは一意になり必ず収束する。
+const fetchTiedOutboxRefs = async (timeline: string, author: string, cursor: string): Promise<OutboxRef[]> => {
+    const directPrefix = `${timeline.replace(/\/$/, '')}/`;
+    const prefixes = [`${directPrefix}x`];
+    const refs: OutboxRef[] = [];
+
+    while (prefixes.length > 0) {
+        const prefix = prefixes.pop()!;
+        const page = await concrntApi.requestConcrntApi<{ items: SignedDocument[], next: string | null }>(
+            config.concrnt.domain,
+            'net.concrnt.core.query',
+            { prefix, author, since: cursor, until: cursor, limit: '100', order: 'desc' },
+        );
+
+        if (page.next != null && prefix.length < directPrefix.length + 25) {
+            for (const char of CDID_ALPHABET) prefixes.push(prefix + char);
+            continue;
+        }
+
+        for (const sd of page.items) {
+            const key = sd.cckv;
+            const suffix = key?.startsWith(directPrefix) ? key.slice(directPrefix.length) : '';
+            if (!/^x[0-9a-hjkmnp-wyz]{24}$/.test(suffix)) continue;
+            let refDoc: any;
+            try { refDoc = JSON.parse(sd.document); } catch { continue; }
+            const href: string | undefined = refDoc.value?.href;
+            const keyNs = epochNs(refDoc.value?.createdAt ?? refDoc.createdAt ?? '');
+            if (href && keyNs != null) refs.push({ href, schema: refDoc.value?.schema, keyNs });
+        }
+    }
+
+    return refs;
+};
+
 federation.setOutboxDispatcher(
     `${actorPath}/{identifier}/outbox`,
     async (ctx, identifier, cursor) => {
@@ -930,7 +977,7 @@ federation.setOutboxDispatcher(
         let nextCursor: string | null = null;
 
         for (let round = 0; round < OUTBOX_MAX_SCAN_ROUNDS && activities.length < OUTBOX_PAGE_SIZE; round++) {
-            const refs: { href: string, schema?: string, keyNs: bigint }[] = [];
+            let refs: OutboxRef[] = [];
             // 同じround内の複数timelineだけを重複排除する。境界以下で次roundへ
             // 保留した参照は、inclusive cursorで再取得できるようglobalなseenへ入れない。
             const roundSeen = new Set<string>();
@@ -970,7 +1017,19 @@ federation.setOutboxDispatcher(
             // 「境界より厳密に新しい」行だけを今回のページに載せる。境界タイと
             // 保留分はuntil境界包含により次ページで必ず返る
             const b = boundary;
-            const emittable = b != null ? refs.filter(r => r.keyNs > b.ns) : refs;
+            const stalled = b != null && b.cursor === until;
+            if (stalled) {
+                const tied = (await Promise.all(
+                    timelines.map((timeline) => fetchTiedOutboxRefs(timeline, entity.ccid, b.cursor))
+                )).flat();
+                const tieSeen = new Set<string>();
+                refs = tied.filter((ref) => {
+                    if (seen.has(ref.href) || tieSeen.has(ref.href)) return false;
+                    tieSeen.add(ref.href);
+                    return true;
+                });
+            }
+            const emittable = stalled ? refs : b != null ? refs.filter(r => r.keyNs > b.ns) : refs;
             emittable.sort((x, y) => (x.keyNs < y.keyNs ? 1 : x.keyNs > y.keyNs ? -1 : 0));
 
             for (const ref of emittable) {
@@ -999,9 +1058,9 @@ federation.setOutboxDispatcher(
                 nextCursor = null;
                 break;
             }
-            if (boundary.cursor === until) {
-                // カーソルが進まない場合は打ち切る(CIP-5 §3.3)
-                nextCursor = null;
+            if (stalled) {
+                // 同一時刻の全行を上で回収済み。1ns前へ進めて古い行のページングを継続する。
+                nextCursor = epochNsToIso(b.ns - 1n);
                 break;
             }
             nextCursor = boundary.cursor;
