@@ -1,4 +1,4 @@
-import { Note, Document as APDocument, Emoji, Hashtag, Image, Mention, isActor, PUBLIC_COLLECTION } from "@fedify/vocab";
+import { Note, Document as APDocument, Announce, Create, Emoji, Hashtag, Image, Mention, isActor, PUBLIC_COLLECTION } from "@fedify/vocab";
 import type { Context } from "@fedify/fedify";
 import { Temporal } from "@js-temporal/polyfill";
 import { eq } from "drizzle-orm";
@@ -12,6 +12,7 @@ import {
     SCHEMA_PLAINTEXT,
     SCHEMA_REPLY,
     SCHEMA_REROUTE,
+    isPlainReroute,
 } from './schemas.ts';
 
 export * from './schemas.ts';
@@ -211,5 +212,42 @@ export const buildNote = async (
         url: noteId,
         tags: [...buildTags(parts), ...mentions.tags],
         attachments: buildAttachments(parts, medias),
+    });
+}
+
+// concrntメッセージドキュメントをAPアクティビティへ変換する。
+// テキストなしreroute → Announce (boost)、それ以外 → Create(Note)。変換不能ならnull。
+// idは決定的(reroute: /ap/announces/<cckv>、それ以外: <noteId>#activity)なので、
+// daemonのリアルタイム送出とoutboxの列挙が同一アクティビティを生成する。
+export const buildActivity = async (
+    ctx: Context<unknown>,
+    values: { identifier: string, id: string },
+    document: any,
+): Promise<Announce | Create | null> => {
+    if (isPlainReroute(document)) {
+        const targetURI: string | undefined = document.value?.targetURI;
+        if (!targetURI) return null;
+
+        const objectRef = await resolveApObjectUrl(ctx, targetURI);
+        if (!objectRef) return null;
+
+        return new Announce({
+            id: new URL(`${config.activitypub.baseUrl}/ap/announces/${encodeURIComponent(values.id)}`),
+            actor: ctx.getActorUri(values.identifier),
+            object: new URL(objectRef),
+            tos: [PUBLIC_COLLECTION],
+            ccs: [ctx.getFollowersUri(values.identifier)],
+        });
+    }
+
+    const note = await buildNote(ctx, values, document);
+    if (note == null) return null;
+
+    return new Create({
+        id: new URL("#activity", note.id ?? undefined),
+        object: note,
+        actors: note.attributionIds,
+        tos: note.toIds,
+        ccs: note.ccIds,
     });
 }

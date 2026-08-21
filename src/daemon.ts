@@ -2,14 +2,14 @@ import { db, apEntity, apObjectReference, type ApEntity } from './db/index.ts';
 import { Redis } from "ioredis";
 import { and, eq } from "drizzle-orm";
 import fedi, { buildPerson } from "./federation.ts";
-import { Announce, Create, Delete, Emoji, Follow, Image, isActor, Like, Note, PUBLIC_COLLECTION, Tombstone, Undo, Update } from '@fedify/vocab';
+import { Announce, Delete, Emoji, Follow, Image, isActor, Like, Note, PUBLIC_COLLECTION, Tombstone, Undo, Update } from '@fedify/vocab';
 
 import { getLogger } from "@logtape/logtape";
 import { type Document } from "@concrnt/client";
 
 import concrntApi, { commit } from "./concrnt.ts";
 import { config } from "./config.ts";
-import { buildNote, isPlainReroute, resolveApObjectUrl, SCHEMA_AP_NOTE, SCHEMA_REFERENCE, SCHEMA_LIKE, SCHEMA_REACTION, SCHEMA_DELETE } from "./convert.ts";
+import { buildActivity, SCHEMA_AP_NOTE, SCHEMA_REFERENCE, SCHEMA_LIKE, SCHEMA_REACTION, SCHEMA_DELETE } from "./convert.ts";
 import { SCHEMA_AP_FOLLOW, SCHEMA_AP_FOLLOWER, SCHEMA_AP_ACCEPT_STATE, AP_NAMESPACE, acceptStateKey, settingsKey, type ApFollowerValue, type ApAcceptStateValue } from "./schemas.ts";
 import * as followStore from "./followStore.ts";
 import * as settingsStore from "./settingsStore.ts";
@@ -105,69 +105,35 @@ const handleOutboundCreate = async (entity: ApEntity, cckv: string, document: an
     const baseURL = new URL(config.activitypub.baseUrl);
     const ctx = fedi.createContext(baseURL, undefined);
 
-    if (isPlainReroute(document)) {
-        // テキストなしreroute → Announce (boost)
-        const targetURI: string | undefined = document.value?.targetURI;
-        if (!targetURI) return;
+    // 手元のdocumentから直接アクティビティを構築する(自己HTTP経由の再取得を避ける)。
+    const activity = await buildActivity(ctx, { identifier: entity.id, id: cckv }, document);
+    if (activity == null) {
+        logger.info(`Document does not resolve to an AP activity, skipping: ${cckv}`);
+        return;
+    }
 
-        const objectRef = await resolveApObjectUrl(ctx, targetURI);
-        if (!objectRef) {
-            logger.info(`Reroute target is not resolvable to an AP object, skipping: ${targetURI}`);
-            return;
-        }
+    await ctx.sendActivity(
+        { identifier: entity.id },
+        "followers",
+        activity,
+    );
 
-        const announceId = new URL(`${config.activitypub.baseUrl}/ap/announces/${encodeURIComponent(cckv)}`);
-
-        await ctx.sendActivity(
-            { identifier: entity.id },
-            "followers",
-            new Announce({
-                id: announceId,
-                actor: ctx.getActorUri(entity.id),
-                object: new URL(objectRef),
-                tos: [PUBLIC_COLLECTION],
-                ccs: [ctx.getFollowersUri(entity.id)],
-            }),
-        );
-
+    if (activity instanceof Announce) {
         // unboost時にUndo(Announce)を送るための対応を記録
         await db.insert(apObjectReference).values({
-            apObjectId: announceId.href,
+            apObjectId: activity.id!.href,
             ccUri: cckv,
             refType: 'outbound-announce',
-            meta: { object: objectRef },
+            meta: { object: activity.objectId!.href },
         }).onConflictDoNothing();
 
         return;
     }
 
-    // 通常投稿・引用reroute → Create(Note)。
-    // 手元のdocumentから直接Noteを構築する(自己HTTP経由の再取得を避ける)。
-    const noteArgs = { identifier: entity.id, id: cckv };
-    const note = await buildNote(ctx, noteArgs, document);
-    if (note == null) {
-        logger.info(`Document does not resolve to a Note, skipping: ${cckv}`);
-        return;
-    }
-
-    const createActivity = new Create({
-        id: new URL("#activity", note.id ?? undefined),
-        object: note,
-        actors: note.attributionIds,
-        tos: note.toIds,
-        ccs: note.ccIds,
-    });
-
-    await ctx.sendActivity(
-        { identifier: entity.id },
-        "followers",
-        createActivity,
-    );
-
     // deletedイベントはdistributesを運ばず監視設定と突合できないため、
     // 送信済みNoteを記録しておき、削除時はこの対応表で判定する
     await db.insert(apObjectReference).values({
-        apObjectId: ctx.getObjectUri(Note, noteArgs).href,
+        apObjectId: ctx.getObjectUri(Note, { identifier: entity.id, id: cckv }).href,
         ccUri: cckv,
         refType: 'outbound-note',
     }).onConflictDoNothing();
@@ -177,7 +143,7 @@ const handleOutboundCreate = async (entity: ApEntity, cckv: string, document: an
     const followersUri = ctx.getFollowersUri(entity.id).href;
     const documentLoader = await ctx.getDocumentLoader({ identifier: entity.id });
     const extraRecipients = (await Promise.all(
-        note.ccIds
+        activity.ccIds
             .filter(cc => cc.href !== PUBLIC_COLLECTION.href && cc.href !== followersUri)
             .map(cc => ctx.lookupObject(cc.href, { documentLoader }).catch(() => null))
     )).filter(isActor);
@@ -185,7 +151,7 @@ const handleOutboundCreate = async (entity: ApEntity, cckv: string, document: an
         await ctx.sendActivity(
             { identifier: entity.id },
             extraRecipients,
-            createActivity,
+            activity,
             // ローカル同士のメンションがAPブリッジ経由で二重通知されるのを防ぐ
             { excludeBaseUris: [baseURL] },
         );
@@ -424,6 +390,69 @@ const handleAssociationDeleted = async (msg: CoreEvent) => {
 // Follow/Undo(Follow)を突合できるよう、followレコードのキーから決定的にアクティビティidを導出する
 const followActivityId = (recordKey: string) =>
     new URL(`${config.activitypub.baseUrl}/ap/follows/${encodeURIComponent(recordKey)}`);
+
+// pendingのフォローへFollowアクティビティを再送する(app.tsの内部API用)。
+// v1移行はAcceptを取りこぼしたaccepted=false行をpendingのまま持ち込むため、
+// リモートでは確立済みの関係が承認待ち表示で残ることがある。重複Followには
+// Mastodon等が冪等にAcceptを返すので、再送は検証と修復を兼ねる。activity idは
+// 初回送信と同じfollowActivityId(レコードキー由来)なのでAccept突合も変わらない。
+export interface ResendFollowResult { ccid: string, actorURI: string, status: 'sent' | 'failed' | 'skipped', reason?: string }
+
+export const resendPendingFollows = async (opts: { ccid?: string, actorURIs?: string[], dryRun?: boolean }): Promise<ResendFollowResult[]> => {
+    if (opts.ccid !== undefined && opts.ccid.trim() === '') {
+        throw new TypeError('ccid must be a non-empty string when provided');
+    }
+    const ctx = fedi.createContext(new URL(config.activitypub.baseUrl), undefined);
+    // propertyが無い時だけ全pendingを対象にする。明示された空配列は「対象なし」。
+    const wanted = opts.actorURIs === undefined ? null : new Set(opts.actorURIs);
+
+    // accept-stateをpendingの既定値と区別できる状態にしてから対象を列挙する。
+    await followStore.ensureServiceRecordsLoaded();
+
+    let entities = await db.select().from(apEntity).where(eq(apEntity.enabled, true));
+    if (opts.ccid) entities = entities.filter((e) => e.ccid === opts.ccid);
+
+    const results: ResendFollowResult[] = [];
+    for (const entity of entities) {
+        await followStore.ensureEntityFollowsLoaded(entity.ccid);
+        for (const entry of followStore.getFollowing(entity.ccid)) {
+            if (wanted && !wanted.has(entry.actorURI)) continue;
+            if (entry.status !== 'pending') {
+                // 明示指定された対象がpendingでない場合だけ、その旨を報告する
+                if (wanted) results.push({ ccid: entity.ccid, actorURI: entry.actorURI, status: 'skipped', reason: `state is ${entry.status}` });
+                continue;
+            }
+            if (opts.dryRun) {
+                results.push({ ccid: entity.ccid, actorURI: entry.actorURI, status: 'skipped', reason: 'dry-run' });
+                continue;
+            }
+            try {
+                const documentLoader = await ctx.getDocumentLoader({ identifier: entity.id });
+                const actor = await ctx.lookupObject(entry.actorURI, { documentLoader });
+                if (actor == null || !isActor(actor) || actor.id == null) {
+                    results.push({ ccid: entity.ccid, actorURI: entry.actorURI, status: 'failed', reason: 'actor does not resolve' });
+                    continue;
+                }
+                await ctx.sendActivity(
+                    { identifier: entity.id },
+                    actor,
+                    new Follow({
+                        id: followActivityId(entry.key),
+                        actor: ctx.getActorUri(entity.id),
+                        object: new URL(entry.actorURI),
+                        to: new URL(entry.actorURI),
+                    }),
+                    { excludeBaseUris: [new URL(config.activitypub.baseUrl)] },
+                );
+                logger.info(`Re-sent Follow to ${entry.actorURI} for ${entity.id}`);
+                results.push({ ccid: entity.ccid, actorURI: entry.actorURI, status: 'sent' });
+            } catch (error) {
+                results.push({ ccid: entity.ccid, actorURI: entry.actorURI, status: 'failed', reason: String(error) });
+            }
+        }
+    }
+    return results;
+}
 
 const deleteServiceRecord = async (key: string) => {
     const document: Document<string> = {

@@ -1,5 +1,5 @@
 import { createFederation, exportJwk, generateCryptoKeyPair } from "@fedify/fedify";
-import { Person, Application, Follow, Endpoints, Accept, Reject, Undo, Note, PUBLIC_COLLECTION, type Recipient, Create, Like, Delete, Announce, EmojiReact, Emoji, Image, Update, Mention, isActor, type Actor } from "@fedify/vocab";
+import { Person, Application, Follow, Endpoints, Accept, Reject, Undo, Note, PUBLIC_COLLECTION, type Recipient, Activity, Create, Like, Delete, Announce, EmojiReact, Emoji, Image, Update, Mention, isActor, type Actor } from "@fedify/vocab";
 import type { Context } from "@fedify/fedify";
 import { getLogger } from "@logtape/logtape";
 import { RedisKvStore, RedisMessageQueue } from "@fedify/redis";
@@ -7,14 +7,15 @@ import { Redis } from "ioredis";
 import { db, apEntity, apKeys, apObjectReference, type ApEntity } from './db/index.ts';
 import { importJwk } from "@fedify/fedify";
 import { eq, and } from "drizzle-orm";
-import { CDID, NotFoundError, type Document } from '@concrnt/client'
+import { CDID, NotFoundError, type Document, type SignedDocument } from '@concrnt/client'
 
 import concrntApi, { commit, importCommit } from "./concrnt.ts";
 import { config } from "./config.ts";
-import { SCHEMA_AP_NOTE, SCHEMA_REROUTE, SCHEMA_LIKE, SCHEMA_REACTION, SCHEMA_MENTION, SCHEMA_REPLY_ASSOCIATION, SCHEMA_DELETE, parseEmojiShortcode, renderMarkdownToHtml, buildNote } from "./convert.ts";
-import { SCHEMA_AP_FOLLOWER, SCHEMA_AP_ACCEPT_STATE, followerKey, acceptStateKey, type ApFollowerValue } from "./schemas.ts";
+import { SCHEMA_AP_NOTE, SCHEMA_REROUTE, SCHEMA_REFERENCE, SCHEMA_LIKE, SCHEMA_REACTION, SCHEMA_MENTION, SCHEMA_REPLY_ASSOCIATION, SCHEMA_DELETE, parseEmojiShortcode, renderMarkdownToHtml, buildNote, buildActivity } from "./convert.ts";
+import { SCHEMA_AP_FOLLOWER, SCHEMA_AP_ACCEPT_STATE, AP_NAMESPACE, followerKey, acceptStateKey, type ApFollowerValue } from "./schemas.ts";
 import { selectCreateRecipientCcids } from "./inboundDelivery.ts";
 import * as followStore from "./followStore.ts";
+import * as settingsStore from "./settingsStore.ts";
 import * as objectCache from "./objectCache.ts";
 
 const logger = getLogger("activitypub");
@@ -207,6 +208,8 @@ const purgeFollower = async (actorURI: string, cause: string) => {
 const federation = createFederation({
     kv: new RedisKvStore(new Redis(config.redis.url)),
     queue: new RedisMessageQueue(() => new Redis(config.redis.url)),
+    // dev専用フラグ。本番configでは設定しないこと(SSRF防御が無効になる)
+    allowPrivateAddress: config.activitypub.allowPrivateAddress,
     // 配送失敗(リトライ毎)の観測用。LogTapeのproperties非表示問題を避けて本文に埋め込む
     onOutboxError: (error, activity) => {
         logger.warn(`Outbox delivery failure: activity=${activity?.id?.href} error=${error}`);
@@ -875,15 +878,361 @@ federation.setActorDispatcher(`${actorPath}/{identifier}`, async (ctx, identifie
     return pairs;
 });
 
-// Mastodon等のUI表示用の最小実装。投稿の列挙は今のところ提供しない。
+// 過去投稿のページング付きoutbox。ソースはCIP-5 queryのparent(=listen対象
+// タイムライン直下の配布referenceの列挙)+authorフィルタ。配布referenceは
+// document-reference proofにより「referenceのauthor=参照先のauthor」が強制される
+// ため、author指定で本人投稿の配布行だけがサーバー側で絞れる(CIP-5 §3.1)。
+// 各referenceのvalue.hrefから元ドキュメントを解決してbuildActivityへ渡すので、
+// activity idは送出時と同一になる。
+// カーソルはサーバーのnextカーソル(limit+1方式・実効createdAt=参照先のcreatedAt)を
+// 無加工でエコーバックする(CIP-5 §3.3)。untilは境界包含で、境界の行はlimit+1件目
+// として前ページで未放出のため、取りこぼしも重複も発生しない。空文字=最新から。
+// 1ページで返す活動数の目標。これが埋まるまで読み進める
+const OUTBOX_PAGE_SIZE = 20;
+// query1回のフェッチ幅(サーバー上限100)。authorで絞れている前提なので
+// PAGE_SIZE+削除済み等で落ちる分の余裕があれば足りる
+const OUTBOX_FETCH_LIMIT = 30;
+// 対象外の行が支配的な区間(author未対応の旧サーバー等)でページが
+// 埋まらなくても打ち切る読み進め上限
+const OUTBOX_MAX_SCAN_ROUNDS = 5;
+const OUTBOX_MAX_TIED_REFS = 500;
+const SCHEMA_USER_TIMELINE = "https://schema.concrnt.world/t/user.json";
+const SCHEMA_COMMUNITY_TIMELINE = "https://schema.concrnt.world/t/community.json";
+
+// RFC3339タイムスタンプをns精度のepochに変換する(パース不能ならnull)。
+// サーバーのカーソル/ソートキーはμ秒以上の精度を持ちうるため、
+// ms丸め(Date.parse単体)で比較すると境界の取りこぼし・重複が起こる
+const epochNs = (iso: string): bigint | null => {
+    const m = /^(.+?)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$/.exec(iso);
+    if (!m) return null;
+    const baseMs = Date.parse(m[1] + m[3]);
+    if (Number.isNaN(baseMs)) return null;
+    const frac = (m[2] ?? '').padEnd(9, '0').slice(0, 9);
+    return BigInt(baseMs) * 1_000_000n + BigInt(frac || '0');
+};
+
+const epochNsToIso = (ns: bigint): string => {
+    const seconds = ns / 1_000_000_000n;
+    const fraction = (ns % 1_000_000_000n).toString().padStart(9, '0');
+    return `${new Date(Number(seconds * 1_000n)).toISOString().slice(0, 19)}.${fraction}Z`;
+};
+
+interface ParsedOutboxCursor { until: string, tieOffset: number }
+const TIED_CURSOR_PREFIX = 'tied:';
+
+const parseOutboxCursor = (cursor: string | null): ParsedOutboxCursor | null => {
+    if (cursor == null || cursor === '') return null;
+    if (!cursor.startsWith(TIED_CURSOR_PREFIX)) {
+        return epochNs(cursor) == null ? null : { until: cursor, tieOffset: 0 };
+    }
+    try {
+        const value = JSON.parse(decodeURIComponent(cursor.slice(TIED_CURSOR_PREFIX.length)));
+        return typeof value?.until === 'string' && epochNs(value.until) != null &&
+            Number.isSafeInteger(value.tieOffset) && value.tieOffset >= 0
+            ? value as ParsedOutboxCursor
+            : null;
+    } catch {
+        return null;
+    }
+};
+
+const tiedOutboxCursor = (until: string, tieOffset: number): string =>
+    `${TIED_CURSOR_PREFIX}${encodeURIComponent(JSON.stringify({ until, tieOffset }))}`;
+
+// ConcrntのCDIDはxをhash種別の先頭文字として予約するため、payload側は
+// i/l/o/xを除外しuを含む独自Base32を使う(core/cdidのencodingと同一)。
+const CDID_ALPHABET = "0123456789abcdefghjkmnpqrstuvwyz";
+
+const isHashCDID = (value: string): boolean =>
+    value.length === 25 && value[0] === 'x' &&
+    [...value.slice(1)].every(char => CDID_ALPHABET.includes(char));
+
+interface OutboxRef { href: string, schema?: string, keyNs: bigint }
+
+const parseOutboxRef = (sd: SignedDocument): OutboxRef | null => {
+    let refDoc: any;
+    try { refDoc = JSON.parse(sd.document); } catch { return null; }
+    const href: string | undefined = refDoc.value?.href;
+    const keyNs = epochNs(refDoc.value?.createdAt ?? refDoc.createdAt ?? '');
+    return href && keyNs != null ? { href, schema: refDoc.value?.schema, keyNs } : null;
+};
+
+const referenceParent = (key: string | undefined, listenPrefix: string): string | null => {
+    if (!key || !key.startsWith(listenPrefix)) return null;
+    const slash = key.lastIndexOf('/');
+    if (slash < 0 || !isHashCDID(key.slice(slash + 1))) return null;
+    return key.slice(0, slash);
+};
+
+// Core queryのtimestamp cursorは同一時刻内のdocument idを表現できない。
+// limitを超える同時刻行では同じcursorが返り続けるため、その時刻だけhash-CDIDの
+// key prefixを再帰分割して全行を回収する。配布referenceはCIP-7によりx+24文字の
+// hash-CDIDへ正規化されているので、各leafは一意になり必ず収束する。
+const fetchExactTiedOutboxRefs = async (timeline: string, author: string, cursor: string): Promise<OutboxRef[]> => {
+    const directPrefix = `${timeline.replace(/\/$/, '')}/`;
+    const prefixes = [`${directPrefix}x`];
+    const refs: OutboxRef[] = [];
+
+    while (prefixes.length > 0) {
+        const prefix = prefixes.pop()!;
+        const page = await concrntApi.requestConcrntApi<{ items: SignedDocument[], next: string | null }>(
+            config.concrnt.domain,
+            'net.concrnt.core.query',
+            { prefix, author, since: cursor, until: cursor, limit: '100', order: 'desc' },
+        );
+
+        if (page.next != null && prefix.length < directPrefix.length + 25) {
+            for (const char of CDID_ALPHABET) prefixes.push(prefix + char);
+            continue;
+        }
+
+        for (const sd of page.items) {
+            const key = sd.cckv;
+            const suffix = key?.startsWith(directPrefix) ? key.slice(directPrefix.length) : '';
+            if (!isHashCDID(suffix)) continue;
+            const ref = parseOutboxRef(sd);
+            if (ref) {
+                refs.push(ref);
+                if (refs.length > OUTBOX_MAX_TIED_REFS) {
+                    throw new Error(`too many tied outbox references below ${timeline}`);
+                }
+            }
+        }
+    }
+
+    return refs;
+};
+
+const listTimelineRoots = async (listenPrefix: string): Promise<string[]> => {
+    const roots = new Set<string>();
+    for (const schema of [SCHEMA_USER_TIMELINE, SCHEMA_COMMUNITY_TIMELINE]) {
+        const visitedCursors = new Set<string>();
+        let until: string | undefined;
+
+        for (;;) {
+            const params: Record<string, string> = {
+                prefix: listenPrefix,
+                schema,
+                limit: '100',
+                order: 'desc',
+            };
+            if (until != null) params.until = until;
+            const page = await concrntApi.requestConcrntApi<{ items: SignedDocument[], next: string | null }>(
+                config.concrnt.domain,
+                'net.concrnt.core.query',
+                params,
+            );
+            for (const sd of page.items) {
+                if (sd.cckv?.startsWith(listenPrefix)) roots.add(sd.cckv.replace(/\/$/, ''));
+            }
+            if (page.next == null) break;
+            // timeline定義自体が100件超で同一時刻の場合、完全列挙できないCore cursorを
+            // 進めて投稿を落とすよりoutboxを失敗させ、再試行可能な状態を保つ。
+            if (visitedCursors.has(page.next)) {
+                throw new Error(`cannot enumerate tied timeline roots below ${listenPrefix}`);
+            }
+            visitedCursors.add(page.next);
+            until = page.next;
+        }
+    }
+    return [...roots];
+};
+
+// listenTimelinesは個別timelineだけでなく親prefixも許す。まず同時刻のprefix検索から
+// 実際のreference親を列挙し、100件を超える場合は参照先recordのdistributesも使って
+// 同じ投稿に属する未取得の親を補完してから、各hash-CDID空間を個別に分割する。
+const fetchTiedOutboxRefs = async (listenPrefix: string, author: string, cursor: string): Promise<OutboxRef[]> => {
+    const page = await concrntApi.requestConcrntApi<{ items: SignedDocument[], next: string | null }>(
+        config.concrnt.domain,
+        'net.concrnt.core.query',
+        { prefix: listenPrefix, author, since: cursor, until: cursor, limit: '100', order: 'desc' },
+    );
+    const refs = page.items.map(parseOutboxRef).filter((ref): ref is OutboxRef => ref != null);
+    if (page.next == null) return refs;
+
+    const timelines = new Set<string>();
+    for (const sd of page.items) {
+        const parent = referenceParent(sd.cckv, listenPrefix);
+        if (parent) timelines.add(parent);
+    }
+
+    for (const timeline of await listTimelineRoots(listenPrefix)) timelines.add(timeline);
+
+    // 同一投稿のreference群はcreatedAtも同じなので、取得済みhrefから元recordを解決すれば
+    // そのdistributesに含まれる他の子timelineも列挙できる。
+    await Promise.all(refs.map(async (ref) => {
+        let document: any;
+        try {
+            document = await concrntApi.getDocument<any>(ref.href, undefined, { negativeTTL: 300_000 });
+        } catch (error) {
+            if (error instanceof NotFoundError) return;
+            throw error;
+        }
+        const distributes: unknown = document?.distributes;
+        if (!Array.isArray(distributes)) return;
+        for (const destination of distributes) {
+            if (typeof destination === 'string' && destination.startsWith(listenPrefix)) {
+                timelines.add(destination.replace(/\/$/, ''));
+            }
+        }
+    }));
+
+    if (timelines.size === 0) return refs;
+    if (timelines.size > OUTBOX_MAX_TIED_REFS) throw new Error(`too many timeline roots below ${listenPrefix}`);
+    const recovered: OutboxRef[] = [];
+    for (const timeline of timelines) {
+        recovered.push(...await fetchExactTiedOutboxRefs(timeline, author, cursor));
+        if (recovered.length > OUTBOX_MAX_TIED_REFS) {
+            throw new Error(`too many tied outbox references below ${listenPrefix}`);
+        }
+    }
+    return recovered;
+};
+
 federation.setOutboxDispatcher(
     `${actorPath}/{identifier}/outbox`,
-    async (ctx, identifier) => {
-        const users = await db.select().from(apEntity).where(eq(apEntity.id, identifier)).limit(1);
-        if (users.length === 0) return null;
-        return { items: [] };
+    async (ctx, identifier, cursor) => {
+        const entity = await db.select().from(apEntity)
+            .where(eq(apEntity.id, identifier)).limit(1).then(res => res[0]);
+        if (!entity) return null;
+
+        const parsedCursor = parseOutboxCursor(cursor);
+        if (cursor && parsedCursor == null) return null;
+
+        // 新規entityがdaemonの60秒周期ロードより先に読まれた場合に備える(ロード済みならno-op)
+        await settingsStore.ensureEntitySettingsLoaded(entity.ccid);
+        const listenTimelines = settingsStore.getListenTimelines(entity.ccid);
+        const timelines = listenTimelines.length > 0
+            ? listenTimelines
+            : [`cckv://${entity.ccid}/concrnt.world/profiles/main/home-timeline`];
+
+        const activities: Activity[] = [];
+        const seen = new Set<string>();
+        let until = parsedCursor?.until;
+        let tieOffset = parsedCursor?.tieOffset ?? 0;
+        let nextCursor: string | null = null;
+
+        for (let round = 0; round < OUTBOX_MAX_SCAN_ROUNDS && activities.length < OUTBOX_PAGE_SIZE; round++) {
+            let refs: OutboxRef[] = [];
+            // 同じround内の複数timelineだけを重複排除する。境界以下で次roundへ
+            // 保留した参照は、inclusive cursorで再取得できるようglobalなseenへ入れない。
+            const roundSeen = new Set<string>();
+            let boundary: { ns: bigint, cursor: string } | null = null;
+
+            for (const timeline of timelines) {
+                const params: Record<string, string> = {
+                    // listenTimelinesはdaemon側でstartsWithのprefixとして扱うため、
+                    // 履歴outboxも同じ範囲を列挙する。
+                    prefix: timeline,
+                    author: entity.ccid,
+                    limit: String(OUTBOX_FETCH_LIMIT),
+                    order: 'desc',
+                };
+                if (until != null) params.until = until;
+                const page = await concrntApi.requestConcrntApi<{ items: SignedDocument[], next: string | null }>(
+                    config.concrnt.domain, 'net.concrnt.core.query', params);
+
+                for (const sd of page.items) {
+                    let refDoc: any;
+                    try { refDoc = JSON.parse(sd.document); } catch { continue; }
+                    const href: string | undefined = refDoc.value?.href;
+                    if (!href || seen.has(href) || roundSeen.has(href)) continue;
+                    roundSeen.add(href);
+                    // サーバーのソートキーと同じ導出: 参照先のcreatedAt、無ければreference自身
+                    const keyNs = epochNs(refDoc.value?.createdAt ?? refDoc.createdAt ?? '');
+                    if (keyNs == null) continue;
+                    refs.push({ href, schema: refDoc.value?.schema, keyNs });
+                }
+                if (page.next != null) {
+                    const ns = epochNs(page.next);
+                    if (ns != null && (boundary == null || ns > boundary.ns)) {
+                        boundary = { ns, cursor: page.next };
+                    }
+                }
+            }
+
+            // 未取得区間が残るtimelineがある場合、全timelineで網羅済みの
+            // 「境界より厳密に新しい」行だけを今回のページに載せる。境界タイと
+            // 保留分はuntil境界包含により次ページで必ず返る
+            const b = boundary;
+            const stalled = b != null && b.cursor === until;
+            if (stalled) {
+                const tied: OutboxRef[] = [];
+                for (const timeline of timelines) {
+                    tied.push(...await fetchTiedOutboxRefs(timeline, entity.ccid, b.cursor));
+                    if (tied.length > OUTBOX_MAX_TIED_REFS) {
+                        throw new Error(`too many tied outbox references for ${identifier}`);
+                    }
+                }
+                const tieSeen = new Set<string>();
+                refs = tied.filter((ref) => {
+                    if (seen.has(ref.href) || tieSeen.has(ref.href)) return false;
+                    tieSeen.add(ref.href);
+                    return true;
+                });
+            }
+            refs.sort((x, y) =>
+                x.keyNs < y.keyNs ? 1 : x.keyNs > y.keyNs ? -1 : x.href.localeCompare(y.href));
+            let tiedPageEnd = 0;
+            const emittable = stalled
+                ? (() => {
+                    const capacity = OUTBOX_PAGE_SIZE - activities.length;
+                    tiedPageEnd = Math.min(refs.length, tieOffset + capacity);
+                    return refs.slice(tieOffset, tiedPageEnd);
+                })()
+                : b != null ? refs.filter(r => r.keyNs > b.ns) : refs;
+
+            for (const ref of emittable) {
+                // author未対応の旧サーバーでは受信リモートノートのreference等が混ざるため、
+                // hrefのcckvホストとブリッジ名前空間でフェッチ前に遮断する
+                if (URL.parse(ref.href)?.host !== entity.ccid) continue;
+                if (ref.href.startsWith(`cckv://${entity.ccid}/${AP_NAMESPACE}/`)) continue;
+                if (ref.schema === SCHEMA_REFERENCE) continue;
+
+                let document: any;
+                try {
+                    document = await concrntApi.getDocument<any>(ref.href, undefined, { negativeTTL: 300_000 });
+                } catch (error) {
+                    if (error instanceof NotFoundError) continue; // 削除済み
+                    throw error; // 一過性障害ではcursorを進めず同じページを再試行させる
+                }
+                // daemon側のfederate対象判定と同一基準
+                if (document.author !== entity.ccid || document.kind !== 'record') continue;
+                if (document.schema === SCHEMA_REFERENCE) continue;
+
+                const activity = await buildActivity(ctx, { identifier, id: document.key ?? ref.href }, document);
+                if (activity == null) continue; // Note化不能・Announce先解決不能
+                activities.push(activity);
+                seen.add(ref.href);
+            }
+
+            if (boundary == null) {
+                // 全timeline終端
+                nextCursor = null;
+                break;
+            }
+            if (stalled) {
+                // 同一時刻のbucketはopaque offset cursorで20件ずつ返す。全件処理後だけ1ns前へ進む。
+                nextCursor = tiedPageEnd < refs.length
+                    ? tiedOutboxCursor(b.cursor, tiedPageEnd)
+                    : epochNsToIso(b.ns - 1n);
+                break;
+            }
+            nextCursor = boundary.cursor;
+            until = boundary.cursor;
+            tieOffset = 0;
+        }
+
+        return { items: activities, nextCursor };
     },
-);
+).setFirstCursor(async (ctx, identifier) => {
+    // firstCursor設定時、コレクション本体のGETではdispatcherが呼ばれないため、
+    // ここでentity存在を確認する。不在時はnull → fedifyが非ページ経路で
+    // dispatcher(cursor=null)を呼び、そちらのentityチェックで404になる。
+    const exists = await db.select().from(apEntity)
+        .where(eq(apEntity.id, identifier)).limit(1).then(res => res.length > 0);
+    return exists ? "" : null;
+});
 
 federation.setFollowersDispatcher(
     `${actorPath}/{identifier}/followers`,

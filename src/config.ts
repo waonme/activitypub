@@ -7,6 +7,8 @@ import { parse } from "yaml";
 export interface AppConfig {
   server: {
     port: number;
+    // operator-only endpoints are disabled when omitted
+    adminToken: string | null;
   };
   database: {
     url: string;
@@ -23,6 +25,7 @@ export interface AppConfig {
     baseUrl: string;
     actorPathSegment: string;
     objectCacheTTL: number; // seconds
+    allowPrivateAddress: boolean; // dev専用: ローカルのモックactorへのfetch/配送を許可する
   };
 }
 
@@ -151,6 +154,9 @@ const readConfig = (): AppConfig => {
   const config: AppConfig = {
     server: {
       port: expectNumber(server.port, "server.port"),
+      adminToken: server.adminToken === undefined
+        ? null
+        : expectString(server.adminToken, "server.adminToken"),
     },
     database: {
       url: expectString(database.url, "database.url"),
@@ -171,6 +177,7 @@ const readConfig = (): AppConfig => {
       objectCacheTTL: activitypub.objectCacheTTL === undefined
         ? 30 * 24 * 60 * 60
         : expectNumber(activitypub.objectCacheTTL, "activitypub.objectCacheTTL"),
+      allowPrivateAddress: activitypub.allowPrivateAddress === true,
     },
   };
 
