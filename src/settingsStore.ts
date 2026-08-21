@@ -12,6 +12,7 @@ import concrntApi from "./concrnt.ts";
 import { SCHEMA_AP_SETTINGS, settingsKey, type ApSettingsValue } from "./schemas.ts";
 
 const logger = getLogger("activitypub");
+export const MAX_LISTEN_TIMELINES = 32;
 
 const listenTimelinesByCcid = new Map<string, string[]>();
 const loadedCcids = new Set<string>();
@@ -22,7 +23,10 @@ const sanitize = (document: { author: string, schema: string, value?: ApSettings
     if (document.author !== ccid || document.schema !== SCHEMA_AP_SETTINGS) return [];
     const timelines = document.value?.listenTimelines;
     if (!Array.isArray(timelines)) return [];
-    return timelines.filter((t): t is string => typeof t === 'string' && t.length > 0);
+    return [...new Set(
+        timelines.filter((t): t is string =>
+            typeof t === 'string' && t.startsWith('cckv://') && t.length <= 2048)
+    )].slice(0, MAX_LISTEN_TIMELINES);
 }
 
 export const getListenTimelines = (ccid: string): string[] =>

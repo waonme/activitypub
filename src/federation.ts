@@ -917,27 +917,30 @@ const epochNsToIso = (ns: bigint): string => {
     return `${new Date(Number(seconds * 1_000n)).toISOString().slice(0, 19)}.${fraction}Z`;
 };
 
-interface ParsedOutboxCursor { until: string, tieOffset: number }
+interface ParsedOutboxCursor { until: string, afterHref?: string, legacyTieOffset?: number }
 const TIED_CURSOR_PREFIX = 'tied:';
 
 const parseOutboxCursor = (cursor: string | null): ParsedOutboxCursor | null => {
     if (cursor == null || cursor === '') return null;
     if (!cursor.startsWith(TIED_CURSOR_PREFIX)) {
-        return epochNs(cursor) == null ? null : { until: cursor, tieOffset: 0 };
+        return epochNs(cursor) == null ? null : { until: cursor };
     }
     try {
         const value = JSON.parse(decodeURIComponent(cursor.slice(TIED_CURSOR_PREFIX.length)));
-        return typeof value?.until === 'string' && epochNs(value.until) != null &&
-            Number.isSafeInteger(value.tieOffset) && value.tieOffset >= 0
-            ? value as ParsedOutboxCursor
-            : null;
+        if (typeof value?.until !== 'string' || epochNs(value.until) == null) return null;
+        if (typeof value.afterHref === 'string') return { until: value.until, afterHref: value.afterHref };
+        // 直前リリースが発行したoffset cursorも一度だけ受理し、次ページから安定キーへ移行する。
+        if (Number.isSafeInteger(value.tieOffset) && value.tieOffset >= 0) {
+            return { until: value.until, legacyTieOffset: value.tieOffset };
+        }
+        return null;
     } catch {
         return null;
     }
 };
 
-const tiedOutboxCursor = (until: string, tieOffset: number): string =>
-    `${TIED_CURSOR_PREFIX}${encodeURIComponent(JSON.stringify({ until, tieOffset }))}`;
+const stableOutboxCursor = (until: string, afterHref: string): string =>
+    `${TIED_CURSOR_PREFIX}${encodeURIComponent(JSON.stringify({ until, afterHref }))}`;
 
 // ConcrntのCDIDはxをhash種別の先頭文字として予約するため、payload側は
 // i/l/o/xを除外しuを含む独自Base32を使う(core/cdidのencodingと同一)。
@@ -1101,7 +1104,8 @@ federation.setOutboxDispatcher(
 
         // 新規entityがdaemonの60秒周期ロードより先に読まれた場合に備える(ロード済みならno-op)
         await settingsStore.ensureEntitySettingsLoaded(entity.ccid);
-        const listenTimelines = settingsStore.getListenTimelines(entity.ccid);
+        const listenTimelines = [...new Set(settingsStore.getListenTimelines(entity.ccid))]
+            .slice(0, settingsStore.MAX_LISTEN_TIMELINES);
         const timelines = listenTimelines.length > 0
             ? listenTimelines
             : [`cckv://${entity.ccid}/concrnt.world/profiles/main/home-timeline`];
@@ -1109,7 +1113,8 @@ federation.setOutboxDispatcher(
         const activities: Activity[] = [];
         const seen = new Set<string>();
         let until = parsedCursor?.until;
-        let tieOffset = parsedCursor?.tieOffset ?? 0;
+        let afterHref = parsedCursor?.afterHref;
+        let legacyTieOffset = parsedCursor?.legacyTieOffset ?? 0;
         let nextCursor: string | null = null;
 
         for (let round = 0; round < OUTBOX_MAX_SCAN_ROUNDS && activities.length < OUTBOX_PAGE_SIZE; round++) {
@@ -1171,16 +1176,19 @@ federation.setOutboxDispatcher(
                     return true;
                 });
             }
+            const resumeNs = until == null ? null : epochNs(until);
+            if (afterHref != null && resumeNs != null) {
+                refs = refs.filter((ref) =>
+                    ref.keyNs < resumeNs || (ref.keyNs === resumeNs && ref.href > afterHref!));
+            }
             refs.sort((x, y) =>
                 x.keyNs < y.keyNs ? 1 : x.keyNs > y.keyNs ? -1 : x.href.localeCompare(y.href));
-            let tiedPageEnd = 0;
-            const emittable = stalled
-                ? (() => {
-                    const capacity = OUTBOX_PAGE_SIZE - activities.length;
-                    tiedPageEnd = Math.min(refs.length, tieOffset + capacity);
-                    return refs.slice(tieOffset, tiedPageEnd);
-                })()
-                : b != null ? refs.filter(r => r.keyNs > b.ns) : refs;
+            const candidates = stalled ? refs : b != null ? refs.filter(r => r.keyNs > b.ns) : refs;
+            const start = stalled ? Math.min(legacyTieOffset, candidates.length) : 0;
+            const capacity = OUTBOX_PAGE_SIZE - activities.length;
+            const pageEnd = Math.min(candidates.length, start + capacity);
+            const emittable = candidates.slice(start, pageEnd);
+            const pageWasCapped = pageEnd < candidates.length;
 
             for (const ref of emittable) {
                 // author未対応の旧サーバーでは受信リモートノートのreference等が混ざるため、
@@ -1207,20 +1215,26 @@ federation.setOutboxDispatcher(
             }
 
             if (boundary == null) {
-                // 全timeline終端
-                nextCursor = null;
+                const last = emittable.at(-1);
+                nextCursor = pageWasCapped && last
+                    ? stableOutboxCursor(epochNsToIso(last.keyNs), last.href)
+                    : null;
+                break;
+            }
+            if (pageWasCapped) {
+                const last = emittable.at(-1)!;
+                nextCursor = stableOutboxCursor(epochNsToIso(last.keyNs), last.href);
                 break;
             }
             if (stalled) {
-                // 同一時刻のbucketはopaque offset cursorで20件ずつ返す。全件処理後だけ1ns前へ進む。
-                nextCursor = tiedPageEnd < refs.length
-                    ? tiedOutboxCursor(b.cursor, tiedPageEnd)
-                    : epochNsToIso(b.ns - 1n);
+                // bucketを処理し終えた時だけ1ns前へ進む。
+                nextCursor = epochNsToIso(b.ns - 1n);
                 break;
             }
             nextCursor = boundary.cursor;
             until = boundary.cursor;
-            tieOffset = 0;
+            afterHref = undefined;
+            legacyTieOffset = 0;
         }
 
         return { items: activities, nextCursor };
