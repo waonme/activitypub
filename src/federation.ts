@@ -975,7 +975,7 @@ const fetchExactTiedOutboxRefs = async (timeline: string, author: string, cursor
     return refs;
 };
 
-const listTimelineRoots = async (listenPrefix: string, author: string): Promise<string[]> => {
+const listTimelineRoots = async (listenPrefix: string): Promise<string[]> => {
     const roots = new Set<string>();
     for (const schema of [SCHEMA_USER_TIMELINE, SCHEMA_COMMUNITY_TIMELINE]) {
         const visitedCursors = new Set<string>();
@@ -985,7 +985,6 @@ const listTimelineRoots = async (listenPrefix: string, author: string): Promise<
             const params: Record<string, string> = {
                 prefix: listenPrefix,
                 schema,
-                author,
                 limit: '100',
                 order: 'desc',
             };
@@ -1029,7 +1028,7 @@ const fetchTiedOutboxRefs = async (listenPrefix: string, author: string, cursor:
         if (parent) timelines.add(parent);
     }
 
-    for (const timeline of await listTimelineRoots(listenPrefix, author)) timelines.add(timeline);
+    for (const timeline of await listTimelineRoots(listenPrefix)) timelines.add(timeline);
 
     // 同一投稿のreference群はcreatedAtも同じなので、取得済みhrefから元recordを解決すれば
     // そのdistributesに含まれる他の子timelineも列挙できる。
