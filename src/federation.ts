@@ -991,7 +991,9 @@ federation.setOutboxDispatcher(
 
             for (const timeline of timelines) {
                 const params: Record<string, string> = {
-                    parent: timeline,
+                    // listenTimelinesはdaemon側でstartsWithのprefixとして扱うため、
+                    // 履歴outboxも同じ範囲を列挙する。
+                    prefix: timeline,
                     author: entity.ccid,
                     limit: String(OUTBOX_FETCH_LIMIT),
                     order: 'desc',
