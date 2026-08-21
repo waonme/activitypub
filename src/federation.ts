@@ -914,8 +914,13 @@ const epochNsToIso = (ns: bigint): string => {
     return `${new Date(Number(seconds * 1_000n)).toISOString().slice(0, 19)}.${fraction}Z`;
 };
 
-// Crockford Base32: i/l/o/uを除外し、xを含む。
-const CDID_ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz";
+// ConcrntのCDIDはxをhash種別の先頭文字として予約するため、payload側は
+// i/l/o/xを除外しuを含む独自Base32を使う(core/cdidのencodingと同一)。
+const CDID_ALPHABET = "0123456789abcdefghjkmnpqrstuvwyz";
+
+const isHashCDID = (value: string): boolean =>
+    value.length === 25 && value[0] === 'x' &&
+    [...value.slice(1)].every(char => CDID_ALPHABET.includes(char));
 
 interface OutboxRef { href: string, schema?: string, keyNs: bigint }
 
@@ -944,7 +949,7 @@ const fetchTiedOutboxRefs = async (timeline: string, author: string, cursor: str
         for (const sd of page.items) {
             const key = sd.cckv;
             const suffix = key?.startsWith(directPrefix) ? key.slice(directPrefix.length) : '';
-            if (!/^x[0123456789abcdefghjkmnpqrstvwxyz]{24}$/.test(suffix)) continue;
+            if (!isHashCDID(suffix)) continue;
             let refDoc: any;
             try { refDoc = JSON.parse(sd.document); } catch { continue; }
             const href: string | undefined = refDoc.value?.href;
