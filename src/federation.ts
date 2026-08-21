@@ -1,5 +1,5 @@
 import { createFederation, exportJwk, generateCryptoKeyPair } from "@fedify/fedify";
-import { Person, Application, Follow, Endpoints, Accept, Reject, Undo, Note, PUBLIC_COLLECTION, type Recipient, Create, Like, Delete, Announce, EmojiReact, Emoji, Image, Update, Mention, isActor, type Actor } from "@fedify/vocab";
+import { Person, Application, Follow, Endpoints, Accept, Reject, Undo, Note, PUBLIC_COLLECTION, type Recipient, Activity, Create, Like, Delete, Announce, EmojiReact, Emoji, Image, Update, Mention, isActor, type Actor } from "@fedify/vocab";
 import type { Context } from "@fedify/fedify";
 import { getLogger } from "@logtape/logtape";
 import { RedisKvStore, RedisMessageQueue } from "@fedify/redis";
@@ -7,14 +7,15 @@ import { Redis } from "ioredis";
 import { db, apEntity, apKeys, apObjectReference, type ApEntity } from './db/index.ts';
 import { importJwk } from "@fedify/fedify";
 import { eq, and } from "drizzle-orm";
-import { CDID, NotFoundError, type Document } from '@concrnt/client'
+import { CDID, NotFoundError, type Document, type SignedDocument } from '@concrnt/client'
 
 import concrntApi, { commit, importCommit } from "./concrnt.ts";
 import { config } from "./config.ts";
-import { SCHEMA_AP_NOTE, SCHEMA_REROUTE, SCHEMA_LIKE, SCHEMA_REACTION, SCHEMA_MENTION, SCHEMA_REPLY_ASSOCIATION, SCHEMA_DELETE, parseEmojiShortcode, renderMarkdownToHtml, buildNote } from "./convert.ts";
-import { SCHEMA_AP_FOLLOWER, SCHEMA_AP_ACCEPT_STATE, followerKey, acceptStateKey, type ApFollowerValue } from "./schemas.ts";
+import { SCHEMA_AP_NOTE, SCHEMA_REROUTE, SCHEMA_REFERENCE, SCHEMA_LIKE, SCHEMA_REACTION, SCHEMA_MENTION, SCHEMA_REPLY_ASSOCIATION, SCHEMA_DELETE, parseEmojiShortcode, renderMarkdownToHtml, buildNote, buildActivity } from "./convert.ts";
+import { SCHEMA_AP_FOLLOWER, SCHEMA_AP_ACCEPT_STATE, AP_NAMESPACE, followerKey, acceptStateKey, type ApFollowerValue } from "./schemas.ts";
 import { selectCreateRecipientCcids } from "./inboundDelivery.ts";
 import * as followStore from "./followStore.ts";
+import * as settingsStore from "./settingsStore.ts";
 import * as objectCache from "./objectCache.ts";
 
 const logger = getLogger("activitypub");
@@ -207,6 +208,8 @@ const purgeFollower = async (actorURI: string, cause: string) => {
 const federation = createFederation({
     kv: new RedisKvStore(new Redis(config.redis.url)),
     queue: new RedisMessageQueue(() => new Redis(config.redis.url)),
+    // dev専用フラグ。本番configでは設定しないこと(SSRF防御が無効になる)
+    allowPrivateAddress: config.activitypub.allowPrivateAddress,
     // 配送失敗(リトライ毎)の観測用。LogTapeのproperties非表示問題を避けて本文に埋め込む
     onOutboxError: (error, activity) => {
         logger.warn(`Outbox delivery failure: activity=${activity?.id?.href} error=${error}`);
@@ -875,15 +878,142 @@ federation.setActorDispatcher(`${actorPath}/{identifier}`, async (ctx, identifie
     return pairs;
 });
 
-// Mastodon等のUI表示用の最小実装。投稿の列挙は今のところ提供しない。
+// 過去投稿のページング付きoutbox。ソースはCIP-5 queryのparent(=listen対象
+// タイムライン直下の配布referenceの列挙)+authorフィルタ。配布referenceは
+// document-reference proofにより「referenceのauthor=参照先のauthor」が強制される
+// ため、author指定で本人投稿の配布行だけがサーバー側で絞れる(CIP-5 §3.1)。
+// 各referenceのvalue.hrefから元ドキュメントを解決してbuildActivityへ渡すので、
+// activity idは送出時と同一になる。
+// カーソルはサーバーのnextカーソル(limit+1方式・実効createdAt=参照先のcreatedAt)を
+// 無加工でエコーバックする(CIP-5 §3.3)。untilは境界包含で、境界の行はlimit+1件目
+// として前ページで未放出のため、取りこぼしも重複も発生しない。空文字=最新から。
+// 1ページで返す活動数の目標。これが埋まるまで読み進める
+const OUTBOX_PAGE_SIZE = 20;
+// query1回のフェッチ幅(サーバー上限100)。authorで絞れている前提なので
+// PAGE_SIZE+削除済み等で落ちる分の余裕があれば足りる
+const OUTBOX_FETCH_LIMIT = 30;
+// 対象外の行が支配的な区間(author未対応の旧サーバー等)でページが
+// 埋まらなくても打ち切る読み進め上限
+const OUTBOX_MAX_SCAN_ROUNDS = 5;
+
+// RFC3339タイムスタンプをns精度のepochに変換する(パース不能ならnull)。
+// サーバーのカーソル/ソートキーはμ秒以上の精度を持ちうるため、
+// ms丸め(Date.parse単体)で比較すると境界の取りこぼし・重複が起こる
+const epochNs = (iso: string): bigint | null => {
+    const m = /^(.+?)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$/.exec(iso);
+    if (!m) return null;
+    const baseMs = Date.parse(m[1] + m[3]);
+    if (Number.isNaN(baseMs)) return null;
+    const frac = (m[2] ?? '').padEnd(9, '0').slice(0, 9);
+    return BigInt(baseMs) * 1_000_000n + BigInt(frac || '0');
+};
+
 federation.setOutboxDispatcher(
     `${actorPath}/{identifier}/outbox`,
-    async (ctx, identifier) => {
-        const users = await db.select().from(apEntity).where(eq(apEntity.id, identifier)).limit(1);
-        if (users.length === 0) return null;
-        return { items: [] };
+    async (ctx, identifier, cursor) => {
+        const entity = await db.select().from(apEntity)
+            .where(eq(apEntity.id, identifier)).limit(1).then(res => res[0]);
+        if (!entity) return null;
+
+        if (cursor && Number.isNaN(Date.parse(cursor))) return null;
+
+        // 新規entityがdaemonの60秒周期ロードより先に読まれた場合に備える(ロード済みならno-op)
+        await settingsStore.ensureEntitySettingsLoaded(entity.ccid).catch(() => {});
+        const listenTimelines = settingsStore.getListenTimelines(entity.ccid);
+        const timelines = listenTimelines.length > 0
+            ? listenTimelines
+            : [`cckv://${entity.ccid}/concrnt.world/profiles/main/home-timeline`];
+
+        const activities: Activity[] = [];
+        const seen = new Set<string>();
+        let until = cursor || undefined;
+        let nextCursor: string | null = null;
+
+        for (let round = 0; round < OUTBOX_MAX_SCAN_ROUNDS && activities.length < OUTBOX_PAGE_SIZE; round++) {
+            const refs: { href: string, schema?: string, keyNs: bigint }[] = [];
+            let boundary: { ns: bigint, cursor: string } | null = null;
+
+            for (const timeline of timelines) {
+                const params: Record<string, string> = {
+                    parent: timeline,
+                    author: entity.ccid,
+                    limit: String(OUTBOX_FETCH_LIMIT),
+                    order: 'desc',
+                };
+                if (until != null) params.until = until;
+                const page = await concrntApi.requestConcrntApi<{ items: SignedDocument[], next: string | null }>(
+                    config.concrnt.domain, 'net.concrnt.core.query', params);
+
+                for (const sd of page.items) {
+                    let refDoc: any;
+                    try { refDoc = JSON.parse(sd.document); } catch { continue; }
+                    const href: string | undefined = refDoc.value?.href;
+                    if (!href || seen.has(href)) continue; // 複数timeline重複のdedupe
+                    seen.add(href);
+                    // サーバーのソートキーと同じ導出: 参照先のcreatedAt、無ければreference自身
+                    const keyNs = epochNs(refDoc.value?.createdAt ?? refDoc.createdAt ?? '');
+                    if (keyNs == null) continue;
+                    refs.push({ href, schema: refDoc.value?.schema, keyNs });
+                }
+                if (page.next != null) {
+                    const ns = epochNs(page.next);
+                    if (ns != null && (boundary == null || ns > boundary.ns)) {
+                        boundary = { ns, cursor: page.next };
+                    }
+                }
+            }
+
+            // 未取得区間が残るtimelineがある場合、全timelineで網羅済みの
+            // 「境界より厳密に新しい」行だけを今回のページに載せる。境界タイと
+            // 保留分はuntil境界包含により次ページで必ず返る
+            const b = boundary;
+            const emittable = b != null ? refs.filter(r => r.keyNs > b.ns) : refs;
+            emittable.sort((x, y) => (x.keyNs < y.keyNs ? 1 : x.keyNs > y.keyNs ? -1 : 0));
+
+            for (const ref of emittable) {
+                // author未対応の旧サーバーでは受信リモートノートのreference等が混ざるため、
+                // hrefのcckvホストとブリッジ名前空間でフェッチ前に遮断する
+                if (URL.parse(ref.href)?.host !== entity.ccid) continue;
+                if (ref.href.startsWith(`cckv://${entity.ccid}/${AP_NAMESPACE}/`)) continue;
+                if (ref.schema === SCHEMA_REFERENCE) continue;
+
+                const document = await concrntApi.getDocument<any>(ref.href, undefined, { negativeTTL: 300_000 })
+                    .catch(() => null);
+                if (document == null) continue; // 削除済み・取得失敗
+                // daemon側のfederate対象判定と同一基準
+                if (document.author !== entity.ccid || document.kind !== 'record') continue;
+                if (document.schema === SCHEMA_REFERENCE) continue;
+
+                const activity = await buildActivity(ctx, { identifier, id: document.key ?? ref.href }, document)
+                    .catch(() => null);
+                if (activity == null) continue; // Note化不能・Announce先解決不能
+                activities.push(activity);
+            }
+
+            if (boundary == null) {
+                // 全timeline終端
+                nextCursor = null;
+                break;
+            }
+            if (boundary.cursor === until) {
+                // カーソルが進まない場合は打ち切る(CIP-5 §3.3)
+                nextCursor = null;
+                break;
+            }
+            nextCursor = boundary.cursor;
+            until = boundary.cursor;
+        }
+
+        return { items: activities, nextCursor };
     },
-);
+).setFirstCursor(async (ctx, identifier) => {
+    // firstCursor設定時、コレクション本体のGETではdispatcherが呼ばれないため、
+    // ここでentity存在を確認する。不在時はnull → fedifyが非ページ経路で
+    // dispatcher(cursor=null)を呼び、そちらのentityチェックで404になる。
+    const exists = await db.select().from(apEntity)
+        .where(eq(apEntity.id, identifier)).limit(1).then(res => res.length > 0);
+    return exists ? "" : null;
+});
 
 federation.setFollowersDispatcher(
     `${actorPath}/{identifier}/followers`,

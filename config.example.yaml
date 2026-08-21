@@ -17,3 +17,5 @@ concrnt:
 #   actorPathSegment: acct
 #   # 受信ノート本文のRedisキャッシュTTL(秒)。デフォルト30日
 #   objectCacheTTL: 2592000
+#   # dev専用: ローカルのモックactorへのfetch/配送を許可する(SSRF防御が無効になるため本番では設定しない)
+#   allowPrivateAddress: true

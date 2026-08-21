@@ -11,6 +11,7 @@ import { eq } from "drizzle-orm";
 import { config } from "./config.ts";
 import * as followStore from "./followStore.ts";
 import * as objectCache from "./objectCache.ts";
+import { resendPendingFollows } from "./daemon.ts";
 
 const logger = getLogger("activitypub");
 
@@ -67,6 +68,18 @@ app.get("/cc-info", (c) =>
 
 // livenessProbe用ヘルスチェック
 app.get("/health", (c) => c.json({ status: "ok" }));
+
+// 運用者向け内部API(prometheus流の/-/プレフィックス): pendingのフォローを一括/選択で再送する。
+// /-/配下はコアのproxy(services paths: [/ap])にも公開リバプロにも
+// ルーティングされない前提で、ブリッジのポートへの直アクセス専用。
+// body: { ccid?: string, actorURIs?: string[], dryRun?: boolean }
+//   ccid省略=全enabledエンティティ / actorURIs指定=そのアクターのみ
+app.post("/-/resend-follows", async (c) => {
+    const body = await c.req.json().catch(() => ({})) as { ccid?: string, actorURIs?: string[], dryRun?: boolean };
+    const results = await resendPendingFollows(body);
+    const count = (s: string) => results.filter((r) => r.status === s).length;
+    return c.json({ sent: count('sent'), failed: count('failed'), skipped: count('skipped'), results });
+});
 
 app.use(federation(fedi, () => undefined));
 app.use(cors({
