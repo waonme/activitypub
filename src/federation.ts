@@ -895,6 +895,7 @@ const OUTBOX_FETCH_LIMIT = 30;
 // 対象外の行が支配的な区間(author未対応の旧サーバー等)でページが
 // 埋まらなくても打ち切る読み進め上限
 const OUTBOX_MAX_SCAN_ROUNDS = 5;
+const OUTBOX_MAX_TIED_REFS = 500;
 const SCHEMA_USER_TIMELINE = "https://schema.concrnt.world/t/user.json";
 const SCHEMA_COMMUNITY_TIMELINE = "https://schema.concrnt.world/t/community.json";
 
@@ -915,6 +916,28 @@ const epochNsToIso = (ns: bigint): string => {
     const fraction = (ns % 1_000_000_000n).toString().padStart(9, '0');
     return `${new Date(Number(seconds * 1_000n)).toISOString().slice(0, 19)}.${fraction}Z`;
 };
+
+interface ParsedOutboxCursor { until: string, tieOffset: number }
+const TIED_CURSOR_PREFIX = 'tied:';
+
+const parseOutboxCursor = (cursor: string | null): ParsedOutboxCursor | null => {
+    if (cursor == null || cursor === '') return null;
+    if (!cursor.startsWith(TIED_CURSOR_PREFIX)) {
+        return epochNs(cursor) == null ? null : { until: cursor, tieOffset: 0 };
+    }
+    try {
+        const value = JSON.parse(decodeURIComponent(cursor.slice(TIED_CURSOR_PREFIX.length)));
+        return typeof value?.until === 'string' && epochNs(value.until) != null &&
+            Number.isSafeInteger(value.tieOffset) && value.tieOffset >= 0
+            ? value as ParsedOutboxCursor
+            : null;
+    } catch {
+        return null;
+    }
+};
+
+const tiedOutboxCursor = (until: string, tieOffset: number): string =>
+    `${TIED_CURSOR_PREFIX}${encodeURIComponent(JSON.stringify({ until, tieOffset }))}`;
 
 // ConcrntのCDIDはxをhash種別の先頭文字として予約するため、payload側は
 // i/l/o/xを除外しuを含む独自Base32を使う(core/cdidのencodingと同一)。
@@ -968,7 +991,12 @@ const fetchExactTiedOutboxRefs = async (timeline: string, author: string, cursor
             const suffix = key?.startsWith(directPrefix) ? key.slice(directPrefix.length) : '';
             if (!isHashCDID(suffix)) continue;
             const ref = parseOutboxRef(sd);
-            if (ref) refs.push(ref);
+            if (ref) {
+                refs.push(ref);
+                if (refs.length > OUTBOX_MAX_TIED_REFS) {
+                    throw new Error(`too many tied outbox references below ${timeline}`);
+                }
+            }
         }
     }
 
@@ -1033,8 +1061,13 @@ const fetchTiedOutboxRefs = async (listenPrefix: string, author: string, cursor:
     // 同一投稿のreference群はcreatedAtも同じなので、取得済みhrefから元recordを解決すれば
     // そのdistributesに含まれる他の子timelineも列挙できる。
     await Promise.all(refs.map(async (ref) => {
-        const document = await concrntApi.getDocument<any>(ref.href, undefined, { negativeTTL: 300_000 })
-            .catch(() => null);
+        let document: any;
+        try {
+            document = await concrntApi.getDocument<any>(ref.href, undefined, { negativeTTL: 300_000 });
+        } catch (error) {
+            if (error instanceof NotFoundError) return;
+            throw error;
+        }
         const distributes: unknown = document?.distributes;
         if (!Array.isArray(distributes)) return;
         for (const destination of distributes) {
@@ -1045,9 +1078,15 @@ const fetchTiedOutboxRefs = async (listenPrefix: string, author: string, cursor:
     }));
 
     if (timelines.size === 0) return refs;
-    return (await Promise.all(
-        [...timelines].map((timeline) => fetchExactTiedOutboxRefs(timeline, author, cursor))
-    )).flat();
+    if (timelines.size > OUTBOX_MAX_TIED_REFS) throw new Error(`too many timeline roots below ${listenPrefix}`);
+    const recovered: OutboxRef[] = [];
+    for (const timeline of timelines) {
+        recovered.push(...await fetchExactTiedOutboxRefs(timeline, author, cursor));
+        if (recovered.length > OUTBOX_MAX_TIED_REFS) {
+            throw new Error(`too many tied outbox references below ${listenPrefix}`);
+        }
+    }
+    return recovered;
 };
 
 federation.setOutboxDispatcher(
@@ -1057,7 +1096,8 @@ federation.setOutboxDispatcher(
             .where(eq(apEntity.id, identifier)).limit(1).then(res => res[0]);
         if (!entity) return null;
 
-        if (cursor && Number.isNaN(Date.parse(cursor))) return null;
+        const parsedCursor = parseOutboxCursor(cursor);
+        if (cursor && parsedCursor == null) return null;
 
         // 新規entityがdaemonの60秒周期ロードより先に読まれた場合に備える(ロード済みならno-op)
         await settingsStore.ensureEntitySettingsLoaded(entity.ccid);
@@ -1068,7 +1108,8 @@ federation.setOutboxDispatcher(
 
         const activities: Activity[] = [];
         const seen = new Set<string>();
-        let until = cursor || undefined;
+        let until = parsedCursor?.until;
+        let tieOffset = parsedCursor?.tieOffset ?? 0;
         let nextCursor: string | null = null;
 
         for (let round = 0; round < OUTBOX_MAX_SCAN_ROUNDS && activities.length < OUTBOX_PAGE_SIZE; round++) {
@@ -1116,9 +1157,13 @@ federation.setOutboxDispatcher(
             const b = boundary;
             const stalled = b != null && b.cursor === until;
             if (stalled) {
-                const tied = (await Promise.all(
-                    timelines.map((timeline) => fetchTiedOutboxRefs(timeline, entity.ccid, b.cursor))
-                )).flat();
+                const tied: OutboxRef[] = [];
+                for (const timeline of timelines) {
+                    tied.push(...await fetchTiedOutboxRefs(timeline, entity.ccid, b.cursor));
+                    if (tied.length > OUTBOX_MAX_TIED_REFS) {
+                        throw new Error(`too many tied outbox references for ${identifier}`);
+                    }
+                }
                 const tieSeen = new Set<string>();
                 refs = tied.filter((ref) => {
                     if (seen.has(ref.href) || tieSeen.has(ref.href)) return false;
@@ -1126,8 +1171,16 @@ federation.setOutboxDispatcher(
                     return true;
                 });
             }
-            const emittable = stalled ? refs : b != null ? refs.filter(r => r.keyNs > b.ns) : refs;
-            emittable.sort((x, y) => (x.keyNs < y.keyNs ? 1 : x.keyNs > y.keyNs ? -1 : 0));
+            refs.sort((x, y) =>
+                x.keyNs < y.keyNs ? 1 : x.keyNs > y.keyNs ? -1 : x.href.localeCompare(y.href));
+            let tiedPageEnd = 0;
+            const emittable = stalled
+                ? (() => {
+                    const capacity = OUTBOX_PAGE_SIZE - activities.length;
+                    tiedPageEnd = Math.min(refs.length, tieOffset + capacity);
+                    return refs.slice(tieOffset, tiedPageEnd);
+                })()
+                : b != null ? refs.filter(r => r.keyNs > b.ns) : refs;
 
             for (const ref of emittable) {
                 // author未対応の旧サーバーでは受信リモートノートのreference等が混ざるため、
@@ -1136,15 +1189,18 @@ federation.setOutboxDispatcher(
                 if (ref.href.startsWith(`cckv://${entity.ccid}/${AP_NAMESPACE}/`)) continue;
                 if (ref.schema === SCHEMA_REFERENCE) continue;
 
-                const document = await concrntApi.getDocument<any>(ref.href, undefined, { negativeTTL: 300_000 })
-                    .catch(() => null);
-                if (document == null) continue; // 削除済み・取得失敗
+                let document: any;
+                try {
+                    document = await concrntApi.getDocument<any>(ref.href, undefined, { negativeTTL: 300_000 });
+                } catch (error) {
+                    if (error instanceof NotFoundError) continue; // 削除済み
+                    throw error; // 一過性障害ではcursorを進めず同じページを再試行させる
+                }
                 // daemon側のfederate対象判定と同一基準
                 if (document.author !== entity.ccid || document.kind !== 'record') continue;
                 if (document.schema === SCHEMA_REFERENCE) continue;
 
-                const activity = await buildActivity(ctx, { identifier, id: document.key ?? ref.href }, document)
-                    .catch(() => null);
+                const activity = await buildActivity(ctx, { identifier, id: document.key ?? ref.href }, document);
                 if (activity == null) continue; // Note化不能・Announce先解決不能
                 activities.push(activity);
                 seen.add(ref.href);
@@ -1156,12 +1212,15 @@ federation.setOutboxDispatcher(
                 break;
             }
             if (stalled) {
-                // 同一時刻の全行を上で回収済み。1ns前へ進めて古い行のページングを継続する。
-                nextCursor = epochNsToIso(b.ns - 1n);
+                // 同一時刻のbucketはopaque offset cursorで20件ずつ返す。全件処理後だけ1ns前へ進む。
+                nextCursor = tiedPageEnd < refs.length
+                    ? tiedOutboxCursor(b.cursor, tiedPageEnd)
+                    : epochNsToIso(b.ns - 1n);
                 break;
             }
             nextCursor = boundary.cursor;
             until = boundary.cursor;
+            tieOffset = 0;
         }
 
         return { items: activities, nextCursor };
