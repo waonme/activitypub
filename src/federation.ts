@@ -895,6 +895,7 @@ const OUTBOX_FETCH_LIMIT = 30;
 // 対象外の行が支配的な区間(author未対応の旧サーバー等)でページが
 // 埋まらなくても打ち切る読み進め上限
 const OUTBOX_MAX_SCAN_ROUNDS = 5;
+const SCHEMA_COMMUNITY_TIMELINE = "https://schema.concrnt.world/t/community.json";
 
 // RFC3339タイムスタンプをns精度のepochに変換する(パース不能ならnull)。
 // サーバーのカーソル/ソートキーはμ秒以上の精度を持ちうるため、
@@ -973,6 +974,39 @@ const fetchExactTiedOutboxRefs = async (timeline: string, author: string, cursor
     return refs;
 };
 
+const listTimelineRoots = async (listenPrefix: string, author: string): Promise<string[]> => {
+    const roots = new Set<string>();
+    const visitedCursors = new Set<string>();
+    let until: string | undefined;
+
+    for (;;) {
+        const params: Record<string, string> = {
+            prefix: listenPrefix,
+            schema: SCHEMA_COMMUNITY_TIMELINE,
+            author,
+            limit: '100',
+            order: 'desc',
+        };
+        if (until != null) params.until = until;
+        const page = await concrntApi.requestConcrntApi<{ items: SignedDocument[], next: string | null }>(
+            config.concrnt.domain,
+            'net.concrnt.core.query',
+            params,
+        );
+        for (const sd of page.items) {
+            if (sd.cckv?.startsWith(listenPrefix)) roots.add(sd.cckv.replace(/\/$/, ''));
+        }
+        if (page.next == null) return [...roots];
+        // timeline定義自体が100件超で同一時刻の場合、完全列挙できないCore cursorを
+        // 進めて投稿を落とすよりoutboxを失敗させ、再試行可能な状態を保つ。
+        if (visitedCursors.has(page.next)) {
+            throw new Error(`cannot enumerate tied timeline roots below ${listenPrefix}`);
+        }
+        visitedCursors.add(page.next);
+        until = page.next;
+    }
+};
+
 // listenTimelinesは個別timelineだけでなく親prefixも許す。まず同時刻のprefix検索から
 // 実際のreference親を列挙し、100件を超える場合は参照先recordのdistributesも使って
 // 同じ投稿に属する未取得の親を補完してから、各hash-CDID空間を個別に分割する。
@@ -990,6 +1024,8 @@ const fetchTiedOutboxRefs = async (listenPrefix: string, author: string, cursor:
         const parent = referenceParent(sd.cckv, listenPrefix);
         if (parent) timelines.add(parent);
     }
+
+    for (const timeline of await listTimelineRoots(listenPrefix, author)) timelines.add(timeline);
 
     // 同一投稿のreference群はcreatedAtも同じなので、取得済みhrefから元recordを解決すれば
     // そのdistributesに含まれる他の子timelineも列挙できる。
@@ -1021,7 +1057,7 @@ federation.setOutboxDispatcher(
         if (cursor && Number.isNaN(Date.parse(cursor))) return null;
 
         // 新規entityがdaemonの60秒周期ロードより先に読まれた場合に備える(ロード済みならno-op)
-        await settingsStore.ensureEntitySettingsLoaded(entity.ccid).catch(() => {});
+        await settingsStore.ensureEntitySettingsLoaded(entity.ccid);
         const listenTimelines = settingsStore.getListenTimelines(entity.ccid);
         const timelines = listenTimelines.length > 0
             ? listenTimelines
