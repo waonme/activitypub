@@ -8,7 +8,7 @@ import { config } from "./config.ts";
 
 const logger = getLogger("activitypub");
 
-startEntityBroker()
+await startEntityBroker();
 
 // HTTP署名(RFC 9421の@target-uri/@authority等)の検証はリクエストURLのscheme/hostに
 // 依存するため、プロキシヘッダの有無に関わらず公開origin(baseUrl)へ強制正規化する
