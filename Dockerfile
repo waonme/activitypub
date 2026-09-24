@@ -16,9 +16,7 @@ COPY --from=deps --chown=node:node /app/node_modules ./node_modules
 COPY --chown=node:node package.json pnpm-lock.yaml tsconfig.json drizzle.config.ts config.example.yaml ./
 COPY --chown=node:node drizzle ./drizzle
 COPY --chown=node:node src ./src
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 USER node
 
