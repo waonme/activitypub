@@ -5,17 +5,21 @@ on:
     tags: [ 'v*.*.*' ]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   goreleaser:
+    if: ${{ github.repository == 'waonme/activitypub' && github.repository_owner == 'waonme' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -27,6 +31,12 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+
+      - name: Install release guard dependencies without lifecycle scripts
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Validate fork release destination
+        run: node --import tsx scripts/check-release-target.ts github
 
       # `pnpm install --prod` and the version stamping run as goreleaser
       # before-hooks (see .goreleaser.yaml)

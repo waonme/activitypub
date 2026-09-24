@@ -247,7 +247,7 @@ const handleProfileUpdate = async (entity: ApEntity) => {
         { identifier: entity.id },
         "followers",
         new Update({
-            id: new URL(`${config.activitypub.baseUrl}/ap/acct/${entity.id}#update-${Date.now()}`),
+            id: new URL(`${config.activitypub.baseUrl}/ap/${config.activitypub.actorPathSegment}/${entity.id}#update-${Date.now()}`),
             actor: ctx.getActorUri(entity.id),
             object: person,
             tos: [PUBLIC_COLLECTION],
@@ -421,8 +421,15 @@ const followActivityId = (recordKey: string) =>
 export interface ResendFollowResult { ccid: string, actorURI: string, status: 'sent' | 'failed' | 'skipped', reason?: string }
 
 export const resendPendingFollows = async (opts: { ccid?: string, actorURIs?: string[], dryRun?: boolean }): Promise<ResendFollowResult[]> => {
+    if (opts.ccid !== undefined && opts.ccid.trim() === '') {
+        throw new TypeError('ccid must be a non-empty string when provided');
+    }
     const ctx = fedi.createContext(new URL(config.activitypub.baseUrl), undefined);
-    const wanted = opts.actorURIs?.length ? new Set(opts.actorURIs) : null;
+    // propertyが無い時だけ全pendingを対象にする。明示された空配列は「対象なし」。
+    const wanted = opts.actorURIs === undefined ? null : new Set(opts.actorURIs);
+
+    // accept-stateをpendingの既定値と区別できる状態にしてから対象を列挙する。
+    await followStore.ensureServiceRecordsLoaded();
 
     let entities = await db.select().from(apEntity).where(eq(apEntity.enabled, true));
     if (opts.ccid) entities = entities.filter((e) => e.ccid === opts.ccid);
@@ -629,22 +636,19 @@ const handleServiceRecordEvent = async (channel: string, msg: CoreEvent) => {
 
 export const startEntityBroker = async () => {
 
-    const redis = new Redis(config.redis.url);
+    const redis = new Redis(config.redis.url, {
+        lazyConnect: true,
+        enableReadyCheck: true,
+        autoResubscribe: true,
+    });
 
-    await updateEntities(); // Initial load of entities
-    await loadOutboundLikes(); // 送信済みLikeのフィルタを初期化
-    setInterval(refreshEntities, 60000); // Update entities every 60 seconds
+    redis.on("error", (error) => {
+        logger.error(`Redis broker error: ${error}`);
+    });
 
     // concrntはrealtimeイベントをcc-event:プレフィックス付きchannelにpublishする
     // (channel = "cc-event:" + リソースURI。payload内のsourceは生URIのまま)
     const CC_EVENT_PREFIX = "cc-event:";
-
-    redis.psubscribe(`${CC_EVENT_PREFIX}*`, (err, count) => {
-        if (err) {
-            logger.error(`Failed to subscribe to Redis channels: ${err}`);
-            return;
-        }
-    });
 
     redis.on("pmessage", async (pattern, rawChannel, message) => {
 
@@ -712,16 +716,30 @@ export const startEntityBroker = async () => {
 
     });
 
-    // 購読開始後に初期ロードする(ロード中に届いたイベントは冪等な適用で収束する)
-    await followStore.initialize(entities.map(e => e.ccid)).catch((error) => {
-        logger.error(`followStore initialization failed (will retry on refresh): ${error}`);
-    });
-    for (const entity of entities) {
-        await settingsStore.ensureEntitySettingsLoaded(entity.ccid).catch((error) => {
-            logger.error(`Failed to load settings for ${entity.ccid} (will retry on refresh): ${error}`);
+    try {
+        await updateEntities(); // Initial load of entities
+        await loadOutboundLikes(); // 送信済みLikeのフィルタを初期化
+
+        // Complete the ready-check before entering subscriber mode, and await
+        // the subscription ACK before allowing HTTP startup.
+        await redis.connect();
+        await redis.psubscribe(`${CC_EVENT_PREFIX}*`);
+
+        // 購読開始後に初期ロードする(ロード中に届いたイベントは冪等な適用で収束する)
+        await followStore.initialize(entities.map(e => e.ccid)).catch((error) => {
+            logger.error(`followStore initialization failed (will retry on refresh): ${error}`);
         });
-        await inboxStore.ensureEntityInboxLoaded(entity.ccid).catch((error) => {
-            logger.error(`Failed to load inbox state for ${entity.ccid} (will retry on refresh): ${error}`);
-        });
+        for (const entity of entities) {
+            await settingsStore.ensureEntitySettingsLoaded(entity.ccid).catch((error) => {
+                logger.error(`Failed to load settings for ${entity.ccid} (will retry on refresh): ${error}`);
+            });
+            await inboxStore.ensureEntityInboxLoaded(entity.ccid).catch((error) => {
+                logger.error(`Failed to load inbox state for ${entity.ccid} (will retry on refresh): ${error}`);
+            });
+        }
+        setInterval(refreshEntities, 60000); // Update entities every 60 seconds
+    } catch (error) {
+        redis.disconnect();
+        throw error;
     }
 }

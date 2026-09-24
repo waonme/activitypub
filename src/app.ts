@@ -23,9 +23,15 @@ interface AuthInfo {
 
 const receiveAuthInfo = (c: HonoContext): AuthInfo | null => {
     const authInfoStr = c.req.header("cc-requester")
-    const authInfo = authInfoStr ? JSON.parse(authInfoStr) as AuthInfo : null;
     logger.debug(`Received request with auth info: ${authInfoStr}`);
-    return authInfo;
+    if (!authInfoStr) return null;
+    try {
+        const authInfo = JSON.parse(authInfoStr) as Partial<AuthInfo>;
+        return typeof authInfo.ccid === "string" ? { ccid: authInfo.ccid } : null;
+    } catch {
+        logger.warn("Received malformed cc-requester header");
+        return null;
+    }
 }
 
 
@@ -76,8 +82,34 @@ app.get("/metrics", async (c) =>
 // body: { ccid?: string, actorURIs?: string[], dryRun?: boolean }
 //   ccid省略=全enabledエンティティ / actorURIs指定=そのアクターのみ
 app.post("/-/resend-follows", async (c) => {
-    const body = await c.req.json().catch(() => ({})) as { ccid?: string, actorURIs?: string[], dryRun?: boolean };
-    const results = await resendPendingFollows(body);
+    const adminToken = config.server.adminToken;
+    if (adminToken == null) {
+        return c.json({ error: "Operator API is disabled" }, 404);
+    }
+    if (c.req.header("authorization") !== `Bearer ${adminToken}`) {
+        return c.json({ error: "Unauthorized" }, 401);
+    }
+    const rawBody: unknown = await c.req.json().catch(() => null);
+    if (rawBody == null || typeof rawBody !== "object" || Array.isArray(rawBody)) {
+        return c.json({ error: "Request body must be a JSON object" }, 400);
+    }
+    const body = rawBody as Record<string, unknown>;
+    if (body.ccid !== undefined && (typeof body.ccid !== "string" || body.ccid.trim() === "")) {
+        return c.json({ error: "ccid must be a non-empty string when provided" }, 400);
+    }
+    if (body.actorURIs !== undefined && (
+        !Array.isArray(body.actorURIs) || body.actorURIs.some((uri) => typeof uri !== "string" || uri.trim() === "")
+    )) {
+        return c.json({ error: "actorURIs must be an array of non-empty strings when provided" }, 400);
+    }
+    if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") {
+        return c.json({ error: "dryRun must be a boolean when provided" }, 400);
+    }
+    const results = await resendPendingFollows({
+        ccid: body.ccid as string | undefined,
+        actorURIs: body.actorURIs as string[] | undefined,
+        dryRun: body.dryRun as boolean | undefined,
+    });
     const count = (s: string) => results.filter((r) => r.status === s).length;
     return c.json({ sent: count('sent'), failed: count('failed'), skipped: count('skipped'), results });
 });

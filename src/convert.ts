@@ -19,13 +19,32 @@ import {
 export * from './schemas.ts';
 export * from './render.ts';
 
+export interface ConversionOptions {
+    // Outbox pages can be retried at the same cursor. Resolve references with
+    // current anonymous authorization and propagate temporary/unknown failures
+    // rather than consuming a partially converted page. Existing push callers
+    // intentionally retain best-effort reference resolution by omitting this.
+    targetResolution?: 'strict-public';
+}
+
+const getConversionTarget = async (targetURI: string, options: ConversionOptions) => {
+    const strict = options.targetResolution === 'strict-public';
+    try {
+        return await concrntApi.getDocument<any>(targetURI, undefined,
+            strict ? { cache: 'no-cache', auth: 'no-auth' } : { negativeTTL: 300_000 });
+    } catch (error) {
+        // SDK 2.0.5 maps HTTP 404/403 to these two types. Offline, timeout,
+        // network, 5xx and unknown errors must remain retryable in an Outbox.
+        if (strict && !(error instanceof NotFoundError) && !(error instanceof PermissionError)) throw error;
+        return null;
+    }
+};
+
 // concrntメッセージURIをAP object URLへ解決する。
 // ap/note.json (リモート投稿の参照) ならその元noteのURL、
 // ローカルメッセージなら作者のAPエンティティ経由でこのブリッジが配信するNoteのURLを返す。
-export const resolveApObjectUrl = async (ctx: Context<unknown>, targetURI: string): Promise<string | null> => {
-    // 存在しないtargetの繰り返しlookupを抑えるため、negative cacheを5分効かせる
-    // (クラスデフォルトのnegativeCacheTTL=300はms比較のため実質無効)
-    const target = await concrntApi.getDocument<any>(targetURI, undefined, { negativeTTL: 300_000 }).catch(() => null);
+export const resolveApObjectUrl = async (ctx: Context<unknown>, targetURI: string, options: ConversionOptions = {}): Promise<string | null> => {
+    const target = await getConversionTarget(targetURI, options);
     if (target == null) return null;
 
     if (target.schema === SCHEMA_AP_NOTE) {
@@ -141,6 +160,7 @@ export const buildNote = async (
     values: { identifier: string, id: string },
     document: any,
     visibility: Visibility,
+    options: ConversionOptions = {},
 ): Promise<Note | null> => {
     const noteId = ctx.getObjectUri(Note, values);
     const actorUri = ctx.getActorUri(values.identifier);
@@ -158,7 +178,7 @@ export const buildNote = async (
 
         // 引用投稿: quoteUrl (FEP-044f) + 未対応サーバー向けに本文末尾へ参照リンク
         const quoteTarget = document.value?.targetURI
-            ? await resolveApObjectUrl(ctx, document.value.targetURI)
+            ? await resolveApObjectUrl(ctx, document.value.targetURI, options)
             : null;
 
         const parts = buildNoteParts(body, document.value?.emojis);
@@ -191,12 +211,12 @@ export const buildNote = async (
 
         const targetURI = document.value?.targetURI;
         if (targetURI) {
-            const target = await concrntApi.getDocument<any>(targetURI, undefined, { negativeTTL: 300_000 }).catch(() => null);
+            const target = await getConversionTarget(targetURI, options);
             if (target?.schema === SCHEMA_AP_NOTE) {
                 replyTarget = URL.parse(target.value?.noteURL);
                 replyToActorId = URL.parse(target.value?.actorURL);
             } else if (target != null) {
-                const apUrl = await resolveApObjectUrl(ctx, targetURI);
+                const apUrl = await resolveApObjectUrl(ctx, targetURI, options);
                 if (apUrl) replyTarget = new URL(apUrl);
             }
         }
@@ -256,12 +276,13 @@ export const buildActivity = async (
     values: { identifier: string, id: string },
     document: any,
     visibility: Visibility,
+    options: ConversionOptions = {},
 ): Promise<Announce | Create | null> => {
     if (isPlainReroute(document)) {
         const targetURI: string | undefined = document.value?.targetURI;
         if (!targetURI) return null;
 
-        const objectRef = await resolveApObjectUrl(ctx, targetURI);
+        const objectRef = await resolveApObjectUrl(ctx, targetURI, options);
         if (!objectRef) return null;
 
         return new Announce({
@@ -272,7 +293,7 @@ export const buildActivity = async (
         });
     }
 
-    const note = await buildNote(ctx, values, document, visibility);
+    const note = await buildNote(ctx, values, document, visibility, options);
     if (note == null) return null;
 
     return new Create({

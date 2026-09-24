@@ -9,12 +9,16 @@
 #
 # local dry run (no publish):  goreleaser release --snapshot --clean
 #                              (needs goreleaser >= 2.14 for meta packages)
+# Install dependencies and set the fork identity first; see README's release
+# guard section. A snapshot still validates its destination, but never publishes.
 version: 2
 
 project_name: concrnt-ap-bridge
 
 before:
   hooks:
+    # Fail closed on local runs too, before packaging or any release upload.
+    - node --import tsx scripts/check-release-target.ts github
     # builds _packaging/stage/concrnt-ap-bridge (the installed tree) and the
     # tarball of it
     - sh _packaging/stage.sh {{ .Version }}
@@ -30,7 +34,7 @@ nfpms:
     # no binaries: only the file tree below (Architecture: all)
     meta: true
     vendor: concrnt
-    homepage: https://github.com/concrnt/activitypub
+    homepage: https://github.com/waonme/activitypub
     maintainer: totegamma <github@gammalab.net>
     description: |-
       ActivityPub bridge for concrnt v2.
@@ -84,7 +88,7 @@ changelog:
 
 release:
   github:
-    owner: concrnt
+    owner: waonme
     name: activitypub
   # releases are usually created from the GitHub UI with hand-written notes
   # (which is what pushes the tag); keep that name/body and only add assets.

@@ -68,4 +68,50 @@ describe('inboxStore', () => {
         expect(inboxStore.hasInbox('con1early')).toBe(true);
         expect(getDocument).not.toHaveBeenCalled();
     });
+
+    it('同時 cold start は同じ取得を待ち、どちらの配送先も落とさない', async () => {
+        let resolve!: (value: unknown) => void;
+        getDocument.mockReturnValue(new Promise(done => { resolve = done; }));
+        const first = inboxStore.filterCcidsWithInbox(['con1concurrent']);
+        await Promise.resolve();
+        let secondSettled = false;
+        const second = inboxStore.filterCcidsWithInbox(['con1concurrent']).then(value => {
+            secondSettled = true;
+            return value;
+        });
+        // Give an incorrectly early return enough microtasks to settle.
+        for (let turn = 0; turn < 10; turn++) await Promise.resolve();
+        expect(secondSettled).toBe(false);
+        expect(getDocument).toHaveBeenCalledTimes(1);
+        resolve({ kind: 'record' });
+        expect(await Promise.all([first, second])).toEqual([['con1concurrent'], ['con1concurrent']]);
+    });
+
+    it('同時初期化の一時障害は全待機者に伝搬し、次回は再試行する', async () => {
+        let reject!: (reason: Error) => void;
+        getDocument.mockReturnValueOnce(new Promise((_done, fail) => { reject = fail; }));
+        const first = inboxStore.ensureEntityInboxLoaded('con1sharedfailure');
+        const second = inboxStore.ensureEntityInboxLoaded('con1sharedfailure');
+        const outcomes = Promise.allSettled([first, second]);
+        await Promise.resolve();
+        reject(new Error('synthetic connection failure'));
+        expect((await outcomes).map(result => result.status)).toEqual(['rejected', 'rejected']);
+        getDocument.mockResolvedValueOnce({ kind: 'record' });
+        expect(await inboxStore.filterCcidsWithInbox(['con1sharedfailure'])).toEqual(['con1sharedfailure']);
+        expect(getDocument).toHaveBeenCalledTimes(2);
+    });
+
+    it.each(['created', 'deleted'] as const)('ロード中の %s は古い取得結果に上書きされない', async type => {
+        const ccid = `con1during${type}`;
+        let resolve!: (value: unknown) => void;
+        let reject!: (reason: Error) => void;
+        getDocument.mockReturnValueOnce(new Promise((done, fail) => { resolve = done; reject = fail; }));
+        const pending = inboxStore.ensureEntityInboxLoaded(ccid);
+        await Promise.resolve();
+        inboxStore.applyEvent(ccid, { type, uri: inboxTimelineKey(ccid) });
+        if (type === 'created') reject(new NotFoundError('not found', inboxTimelineKey(ccid)));
+        else resolve({ kind: 'record' });
+        await pending;
+        expect(inboxStore.hasInbox(ccid)).toBe(type === 'created');
+    });
 });

@@ -12,16 +12,21 @@ import concrntApi from "./concrnt.ts";
 import { SCHEMA_AP_SETTINGS, settingsKey, type ApSettingsValue } from "./schemas.ts";
 
 const logger = getLogger("activitypub");
+export const MAX_LISTEN_TIMELINES = 32;
 
 const listenTimelinesByCcid = new Map<string, string[]>();
 const loadedCcids = new Set<string>();
+const inFlightLoads = new Map<string, Promise<void>>();
 
 const sanitize = (document: { author: string, schema: string, value?: ApSettingsValue }, ccid: string): string[] => {
     // 本人署名かつ正しいスキーマのレコードのみ採用する
     if (document.author !== ccid || document.schema !== SCHEMA_AP_SETTINGS) return [];
     const timelines = document.value?.listenTimelines;
     if (!Array.isArray(timelines)) return [];
-    return timelines.filter((t): t is string => typeof t === 'string' && t.length > 0);
+    return [...new Set(
+        timelines.filter((t): t is string =>
+            typeof t === 'string' && t.startsWith('cckv://') && t.length <= 2048)
+    )].slice(0, MAX_LISTEN_TIMELINES);
 }
 
 export const getListenTimelines = (ccid: string): string[] =>
@@ -30,22 +35,30 @@ export const getListenTimelines = (ccid: string): string[] =>
 // entityのsettingsレコードを未ロードならロードする(新規entityの遅延ロード対応)
 export const ensureEntitySettingsLoaded = async (ccid: string) => {
     if (loadedCcids.has(ccid)) return;
-    loadedCcids.add(ccid);
+    const current = inFlightLoads.get(ccid);
+    if (current) return current;
 
-    try {
-        const document = await concrntApi.getDocument<ApSettingsValue>(settingsKey(ccid));
-        const timelines = sanitize(document, ccid);
-        listenTimelinesByCcid.set(ccid, timelines);
-        logger.info(`settingsStore: loaded ${timelines.length} listen timelines for ${ccid}`);
-    } catch (error) {
-        if (error instanceof NotFoundError) {
-            listenTimelinesByCcid.set(ccid, []);
-            return;
+    const load = (async () => {
+        try {
+            const document = await concrntApi.getDocument<ApSettingsValue>(settingsKey(ccid));
+            const timelines = sanitize(document, ccid);
+            listenTimelinesByCcid.set(ccid, timelines);
+            loadedCcids.add(ccid);
+            logger.info(`settingsStore: loaded ${timelines.length} listen timelines for ${ccid}`);
+        } catch (error) {
+            if (error instanceof NotFoundError) {
+                listenTimelinesByCcid.set(ccid, []);
+                loadedCcids.add(ccid);
+                return;
+            }
+            // 失敗は呼び出し元へ返し、設定無しとしてフォールバックさせない。
+            throw error;
+        } finally {
+            inFlightLoads.delete(ccid);
         }
-        // 失敗時は次の機会(updateEntitiesの60秒周期)に再試行できるようにする
-        loadedCcids.delete(ccid);
-        throw error;
-    }
+    })();
+    inFlightLoads.set(ccid, load);
+    return load;
 }
 
 // settingsレコードのRedisイベントを反映する(即時反映)
