@@ -35,6 +35,7 @@ const byKey = new Map<string, KeyRef>();
 const followingReverse = new Map<string, Set<string>>();
 // follows プレフィックスをロード済みの entity ccid
 const loadedFollowCcids = new Set<string>();
+const inFlightFollowLoads = new Map<string, Promise<void>>();
 
 const getOrCreate = <V>(map: Map<string, Map<string, V>>, ccid: string): Map<string, V> => {
     let inner = map.get(ccid);
@@ -141,8 +142,7 @@ const queryAllByPrefix = async (prefix: string, schema: string): Promise<LoadedR
             // カーソルはcreatedAtのみなので、同一createdAtの行が1ページを超えて
             // 並ぶとnextが同じ値のまま前進できない。この分岐に入った時点で
             // 未取得の行が確実に残っている(nextはlimit+1行目のcreatedAt)。
-            logger.warn(`queryAllByPrefix: pagination stalled at ${page.next} for ${prefix}; loaded only ${results.size} records, results are incomplete`);
-            break;
+            throw new Error(`queryAllByPrefix: pagination stalled at ${page.next} for ${prefix}; refusing incomplete results`);
         }
         since = page.next;
     }
@@ -151,6 +151,7 @@ const queryAllByPrefix = async (prefix: string, schema: string): Promise<LoadedR
 }
 
 let serviceRecordsLoaded = false;
+let serviceRecordsLoad: Promise<void> | null = null;
 
 // サービスアカウント空間の follower / accept-state レコードをロードする
 const loadServiceRecords = async () => {
@@ -184,32 +185,44 @@ const loadServiceRecords = async () => {
 // 未ロード(または前回失敗)ならサービスレコードをロードする。60秒周期で再試行される。
 export const ensureServiceRecordsLoaded = async () => {
     if (serviceRecordsLoaded) return;
-    await loadServiceRecords();
-    serviceRecordsLoaded = true;
+    if (serviceRecordsLoad) return serviceRecordsLoad;
+    serviceRecordsLoad = (async () => {
+        try {
+            await loadServiceRecords();
+            serviceRecordsLoaded = true;
+        } finally {
+            serviceRecordsLoad = null;
+        }
+    })();
+    return serviceRecordsLoad;
 }
 
 // entityのfollowsプレフィックスを未ロードならロードする(新規entityの遅延ロード対応)
 export const ensureEntityFollowsLoaded = async (ccid: string) => {
     if (loadedFollowCcids.has(ccid)) return;
-    loadedFollowCcids.add(ccid);
+    const current = inFlightFollowLoads.get(ccid);
+    if (current) return current;
 
-    try {
-        const follows = await queryAllByPrefix(
-            `cckv://${ccid}/${AP_NAMESPACE}/follows/`, SCHEMA_AP_FOLLOW);
-        let count = 0;
-        for (const rec of follows) {
-            const value = rec.value as ApFollowValue;
-            // 本人署名かつ正しいスキーマのレコードのみ採用する
-            if (rec.author !== ccid || rec.schema !== SCHEMA_AP_FOLLOW || !value?.actorURI) continue;
-            setFollowing({ ccid, key: rec.key, actorURI: value.actorURI });
-            count++;
+    const load = (async () => {
+        try {
+            const follows = await queryAllByPrefix(
+                `cckv://${ccid}/${AP_NAMESPACE}/follows/`, SCHEMA_AP_FOLLOW);
+            let count = 0;
+            for (const rec of follows) {
+                const value = rec.value as ApFollowValue;
+                // 本人署名かつ正しいスキーマのレコードのみ採用する
+                if (rec.author !== ccid || rec.schema !== SCHEMA_AP_FOLLOW || !value?.actorURI) continue;
+                setFollowing({ ccid, key: rec.key, actorURI: value.actorURI });
+                count++;
+            }
+            loadedFollowCcids.add(ccid);
+            logger.info(`followStore: loaded ${count} follows for ${ccid}`);
+        } finally {
+            inFlightFollowLoads.delete(ccid);
         }
-        logger.info(`followStore: loaded ${count} follows for ${ccid}`);
-    } catch (error) {
-        // 失敗時は次の機会(updateEntitiesの60秒周期)に再試行できるようにする
-        loadedFollowCcids.delete(ccid);
-        throw error;
-    }
+    })();
+    inFlightFollowLoads.set(ccid, load);
+    return load;
 }
 
 export const initialize = async (ccids: string[]) => {

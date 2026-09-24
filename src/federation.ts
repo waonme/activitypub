@@ -1,5 +1,5 @@
 import { createFederation, exportJwk, generateCryptoKeyPair } from "@fedify/fedify";
-import { Person, Application, Follow, Endpoints, Accept, Reject, Undo, Note, type Recipient, Activity, Create, Like, Delete, Announce, EmojiReact, Emoji, Image, Update, Mention, type Actor } from "@fedify/vocab";
+import { Person, Application, Follow, Endpoints, Accept, Reject, Undo, Note, PUBLIC_COLLECTION, type Recipient, Activity, Create, Like, Delete, Announce, EmojiReact, Emoji, Image, Update, Mention, isActor, type Actor } from "@fedify/vocab";
 import type { Context } from "@fedify/fedify";
 import { getLogger } from "@logtape/logtape";
 import { RedisKvStore, RedisMessageQueue } from "@fedify/redis";
@@ -14,6 +14,7 @@ import { config } from "./config.ts";
 import { meterProvider } from "./metrics.ts";
 import { SCHEMA_AP_NOTE, SCHEMA_REROUTE, SCHEMA_REFERENCE, SCHEMA_LIKE, SCHEMA_REACTION, SCHEMA_MENTION, SCHEMA_REPLY_ASSOCIATION, SCHEMA_DELETE, parseEmojiShortcode, renderMarkdownToHtml, buildNote, buildActivity, type Visibility } from "./convert.ts";
 import { SCHEMA_AP_FOLLOWER, SCHEMA_AP_ACCEPT_STATE, AP_NAMESPACE, followerKey, acceptStateKey, inboxTimelineKey, type ApFollowerValue } from "./schemas.ts";
+import { selectCreateRecipientCcids } from "./inboundDelivery.ts";
 import * as followStore from "./followStore.ts";
 import * as inboxStore from "./inboxStore.ts";
 import * as settingsStore from "./settingsStore.ts";
@@ -21,10 +22,28 @@ import * as objectCache from "./objectCache.ts";
 
 const logger = getLogger("activitypub");
 
+// Core 1.11 still reports some missing delete targets as HTTP 500. Accept only
+// its exact target-specific missing-record response, never arbitrary transport
+// text containing "not found" (DNS/gateway failures must remain retryable).
+const isMissingDeleteTarget = (error: unknown, target: string): boolean => {
+    if (error instanceof NotFoundError && error.uri === target) return true;
+    if (!(error instanceof Error)) return false;
+    const prefix = /^fetch failed on transport: (?:404|500) /.exec(error.message)?.[0];
+    if (!prefix) return false;
+    try {
+        const body = JSON.parse(error.message.slice(prefix.length)) as { error?: unknown } | null;
+        return body?.error === `${target} not found`
+            || body?.error === `${target} not found\nrecord not found`;
+    } catch {
+        return false;
+    }
+};
+
 // ブリッジ自身のアクター。authorized fetch環境向けに、特定ユーザーに紐づかない
 // fetch(共有インボックスの署名検証・匿名resolve)の署名主体として使う。
 // setup側でこのidの登録を拒否して予約する。
 export const INSTANCE_ACTOR = "instance.actor";
+const actorPath = `/ap/${config.activitypub.actorPathSegment}`;
 
 // AP objectのURLから、ブリッジ管理下のconcrnt保存先キーを決定的に導出する
 const inboxKey = (url: string) =>
@@ -251,7 +270,7 @@ federation.setNodeInfoDispatcher("/ap/nodeinfo/2.1", async (ctx) => {
 })
 
 federation
-    .setInboxListeners("/ap/acct/{identifier}/inbox", "/ap/inbox")
+    .setInboxListeners(`${actorPath}/{identifier}/inbox`, "/ap/inbox")
     .on(Follow, async (ctx, follow) => {
 
         const object = ctx.parseUri(follow.objectId);
@@ -440,6 +459,10 @@ federation
             return;
         }
 
+        // Fedify invalidates the activity's original JSON-LD when getActor()
+        // dereferences it. Capture extensions before any actor/tag resolution.
+        const cacheJson = await objectCache.buildCacheJson(object, create);
+
         // Mentionタグとto/ccからローカルユーザー宛てのメンションを検出する
         const addressed = [...object.toIds, ...object.ccIds, ...create.toIds, ...create.ccIds].map(u => u.href);
         const mentionCandidates = new Set<string>(addressed);
@@ -477,9 +500,26 @@ federation
             }
         }
 
-        // inbox未作成のフォロワーは配送先から外す(policy denyでdead-letterになるだけ)
-        const followerCcids = await inboxStore.filterCcidsWithInbox(followStore.getLocalFollowerCcids(actorUri));
-        if (followerCcids.length === 0 && mentionedEntities.length === 0 && replyTarget == null) {
+        const actor = await create.getActor().catch(() => null);
+        const followersUri = actor?.followersId?.href ?? actorUri + "/followers";
+        const followerCcids = followStore.getLocalFollowerCcids(actorUri);
+
+        // Public/unlisted and followers-only posts fan out to local followers.
+        // Direct posts must go only to explicitly addressed local actors (and
+        // an identified local reply target), otherwise their existence leaks
+        // into every follower's inbox even though resolve later hides content.
+        const explicitlyAddressedCcids = [
+            ...mentionedEntities.map(entity => entity.ccid),
+            ...(replyTarget != null ? [replyTarget.entity.ccid] : []),
+        ];
+        const recipientCcids = selectCreateRecipientCcids(
+            addressed,
+            followersUri,
+            followerCcids,
+            explicitlyAddressedCcids,
+        );
+
+        if (recipientCcids.length === 0) {
             logger.info(`Actor ${actorUri} has no followers, local mentions or reply target. Skipping Create activity.`);
             return;
         }
@@ -487,28 +527,25 @@ federation
         // 本文をキャッシュする。非publicノート(Misskeyのフォロワー限定等)は
         // リモートに再fetchできないため、生の宛先を保存して閲覧可否は
         // 読み出し時にisVisibleToで評価する
-        const actor = await create.getActor().catch(() => null);
         await objectCache.putObject(objectUri, {
-            json: await objectCache.buildCacheJson(object, create),
+            json: cacheJson,
             actorUri,
             addressed,
-            followersUri: actor?.followersId?.href,
+            followersUri,
+            recipientCcids,
             receivedAt: new Date().toISOString(),
         });
 
-        // フォロワーのinboxに加え、リプライ先ユーザー自身のinboxにも配送する
-        // (リプライ先がフォロワーでもある場合はSetで重複排除)。リプライ先のinboxが
-        // 無い場合はnotify-timeline宛ての通知だけになる
-        const noteTimelines = new Set(followerCcids.map(ccid => inboxTimelineKey(ccid)));
-        if (replyTarget != null && (await inboxStore.filterCcidsWithInbox([replyTarget.entity.ccid])).length > 0) {
-            noteTimelines.add(inboxTimelineKey(replyTarget.entity.ccid));
-        }
+        // 宛先の認可とinboxの有無は別条件。本文と通知用の認可情報は保持し、
+        // タイムライン配送だけを作成済みinboxへ限定する。
+        const noteTimelines = (await inboxStore.filterCcidsWithInbox(recipientCcids))
+            .map(ccid => inboxTimelineKey(ccid));
 
         const noteKey = await storeApNote(
             objectUri,
             actorUri,
             object.published ? new Date(object.published.toString()) : new Date(),
-            [...noteTimelines],
+            noteTimelines,
         );
 
         // メンションされたユーザーへはnotify-timeline宛てのassociationで通知する。
@@ -573,7 +610,23 @@ federation
             return;
         }
 
+        const cacheJson = await objectCache.buildCacheJson(object, announce);
+
         const noteActorURL = object.attributionId?.toString() ?? actorUri;
+        const noteActor = await object.getAttribution({ crossOrigin: 'trust' }).catch(() => null);
+        const addressed = [...object.toIds, ...object.ccIds].map(uri => uri.href);
+        const followersUri = noteActor && isActor(noteActor) ? noteActor.followersId?.href : undefined;
+
+        // Announce内側のNoteも受信時の本文を保存する。followers-onlyの
+        // ブースト元は後から再取得できないため、参照レコードだけでは表示不能になる。
+        await objectCache.putObject(noteURL, {
+            json: cacheJson,
+            actorUri: noteActorURL,
+            addressed,
+            ...(followersUri ? { followersUri } : {}),
+            recipientCcids: followStore.getLocalFollowerCcids(noteActorURL),
+            receivedAt: new Date().toISOString(),
+        });
 
         // 内側のnoteは解決できればよいのでタイムラインへは配送しない。
         // ブースト元が古いとbackdate windowに掛かるためimport経路で実体化する
@@ -641,9 +694,9 @@ federation
     .on(Update, async (ctx, update) => {
         logger.debug(`Received Update activity from ${update.actorId}`);
 
-        // キャッシュ済みオブジェクトの本文だけ追従する(未キャッシュ・actor更新はスルー)
+        // 未キャッシュのnoteやactor自体の更新は対象外。
         const object = await update.getObject();
-        if (object?.id == null) return;
+        if (!(object instanceof Note) || object.id == null) return;
 
         // 更新者と対象オブジェクトが同一オリジンであることを確認する
         if (update.actorId == null || new URL(update.actorId.href).host !== object.id.host) {
@@ -653,8 +706,26 @@ federation
 
         const cached = await objectCache.getObject(object.id.href);
         if (cached == null) return;
-        cached.json = await objectCache.buildCacheJson(object, update);
-        await objectCache.putObject(object.id.href, cached);
+        // 同じサーバーの別アカウントに、本文・公開範囲を変更させない。
+        // attributionは省略可能だが、指定された所有者の変更は認めない。
+        if (cached.actorUri !== update.actorId.href
+            || object.attributionIds.some(actor => actor.href !== cached.actorUri)) {
+            logger.warn(`Update actor does not own the cached object: ${object.id}`);
+            return;
+        }
+
+        // S2S Updateは完全置換。削除された宛先を残すと、非公開snapshotにも
+        // 古い認可が永続化される。activity側だけにある宛先も保持し、両方とも
+        // 空/省略なら全員を失効させる。元のJSON-LDに宛先を追加しない。
+        const addressed = [...new Set([
+            ...object.toIds, ...object.ccIds, ...update.toIds, ...update.ccIds,
+        ].map(uri => uri.href))];
+        await objectCache.putObject(object.id.href, {
+            ...cached,
+            json: await objectCache.buildCacheJson(object, update),
+            addressed,
+            receivedAt: new Date().toISOString(),
+        }, { requireExisting: true });
     })
     .on(EmojiReact, async (ctx, react) => {
         await handleLikeActivity(ctx, react);
@@ -665,32 +736,60 @@ federation
     .on(Delete, async (ctx, del) => {
         logger.debug(`Received Delete activity from ${del.actorId}`);
 
-        const object = await del.getObject();
-        if (object == null || object.id == null) {
+        // DeleteのURLは既に410/404の場合もあるため、消えた本文の再fetchは
+        // 所有者判定に使わない。受信したidと独立して保存した所有者を照合する。
+        const objectId = del.objectId;
+        if (objectId == null) {
             logger.warn(`Received Delete activity with missing or invalid object`);
             return;
         }
 
         // 削除者と対象オブジェクトが同一オリジンであることを確認する
         // (他サーバーのコンテンツ削除を防ぐ)
-        if (del.actorId == null || new URL(del.actorId.href).host !== object.id.host) {
-            logger.warn(`Delete actor/object origin mismatch: ${del.actorId} vs ${object.id}`);
+        if (del.actorId == null || new URL(del.actorId.href).host !== objectId.host) {
+            logger.warn(`Delete actor/object origin mismatch: ${del.actorId} vs ${objectId}`);
             return;
         }
 
         // アカウント削除(objectがactor自身)はnoteの保存キーを持たないため対象なし
-        if (object.id.href === del.actorId.href) {
+        if (objectId.href === del.actorId.href) {
             logger.debug(`Ignoring account deletion from ${del.actorId.href}`);
             return;
         }
 
-        await objectCache.deleteObject(object.id.href);
+        const noteKey = inboxKey(objectId.href);
+        const cached = await objectCache.getObject(objectId.href);
+        let owner = cached?.actorUri;
+        if (cached == null) {
+            // Public本文のTTL切れでも、ブリッジが保存したAP-note参照なら
+            // 元の所有者を検証できる。Deleteに含まれるattributedToは証拠にしない。
+            let original: Document<{ actorURL?: string; noteURL?: string }>;
+            try {
+                original = await resolveAsProxy(noteKey);
+            } catch (error) {
+                if (error instanceof NotFoundError || error instanceof PermissionError) {
+                    logger.debug(`Skipping Delete without stored ownership: ${objectId}`);
+                    return;
+                }
+                // 一時的なCore障害を成功扱いにせず、配送リトライへ戻す。
+                throw error;
+            }
+            if (original?.kind === 'record' && original.key === noteKey
+                && original.author === config.concrnt.ccid && original.schema === SCHEMA_AP_NOTE
+                && original.value?.noteURL === objectId.href) {
+                owner = original.value.actorURL;
+            }
+        }
+        if (owner !== del.actorId.href) {
+            logger.warn(`Delete actor does not own the stored object: ${objectId}`);
+            return;
+        }
 
         // リプライとして記録したassociationがあれば先に削除する
         // (note本体の削除が冪等スキップされるリトライ時にも取りこぼさないよう先行)
         const replyRef = await db.select().from(apObjectReference)
             .where(and(
-                eq(apObjectReference.apObjectId, object.id.href),
+                eq(apObjectReference.apObjectId, objectId.href),
                 eq(apObjectReference.refType, 'inbound-reply'),
             )).limit(1).then(res => res[0]);
         if (replyRef != null) {
@@ -704,17 +803,17 @@ federation
                 });
             } catch (error) {
                 // 既に消えているassociationは冪等に成功扱いにする
-                if (!(error instanceof NotFoundError || String(error).includes("not found"))) {
+                if (!isMissingDeleteTarget(error, replyRef.ccUri)) {
                     throw error;
                 }
             }
-            await db.delete(apObjectReference).where(eq(apObjectReference.apObjectId, object.id.href));
+            await db.delete(apObjectReference).where(eq(apObjectReference.apObjectId, objectId.href));
         }
 
         const document: Document<any> = {
             kind: 'delete',
             schema: SCHEMA_DELETE,
-            value: inboxKey(object.id.href),
+            value: noteKey,
             author: config.concrnt.ccid,
             createdAt: new Date(),
         }
@@ -724,14 +823,17 @@ federation
         } catch (error) {
             // 保存していないnoteのDeleteは冪等に成功扱いにする
             // (throwするとfedifyが無駄にリトライし続ける)
-            // 現行コアはcommitハンドラーでErrNotFoundを404にマップせず
-            // 500+"not found"本文で返すため、文字列判定も併用する
-            if (error instanceof NotFoundError || String(error).includes("not found")) {
-                logger.debug(`Delete for unstored object ${object.id.href}: ${error}`);
-                return;
+            // Coreの対象レコード不存在だけを冪等成功とする。
+            if (isMissingDeleteTarget(error, noteKey)) {
+                logger.debug(`Delete for unstored object ${objectId.href}: ${error}`);
+            } else {
+                throw error;
             }
-            throw error;
         }
+
+        // association/noteの削除が失敗したリトライにも所有者証拠を残すため最後。
+        // ストアもロック内で所有者を再検証し、別actorのsnapshotは削除しない。
+        await objectCache.deleteObject(objectId.href, del.actorId.href);
     })
     // 署名検証に失敗した配送の送信元と対象を記録する(戻り値なし=従来通り401で拒否)
     .onUnverifiedActivity(async (_ctx, activity, reason) => {
@@ -806,7 +908,7 @@ export const buildPerson = async (ctx: Context<unknown>, identifier: string): Pr
 
 // id・inbox・publicKey等の必須プロパティはbuildPerson内で設定している(静的解析の誤検知)
 // eslint-disable-next-line @fedify/lint/actor-id-required
-federation.setActorDispatcher("/ap/acct/{identifier}", async (ctx, identifier) => {
+federation.setActorDispatcher(`${actorPath}/{identifier}`, async (ctx, identifier) => {
     if (identifier === INSTANCE_ACTOR) {
         const keys = await ctx.getActorKeyPairs(identifier);
         return new Application({
@@ -872,6 +974,9 @@ const OUTBOX_FETCH_LIMIT = 30;
 // 対象外の行が支配的な区間(author未対応の旧サーバー等)でページが
 // 埋まらなくても打ち切る読み進め上限
 const OUTBOX_MAX_SCAN_ROUNDS = 5;
+const OUTBOX_MAX_TIED_REFS = 500;
+const SCHEMA_USER_TIMELINE = "https://schema.concrnt.world/t/user.json";
+const SCHEMA_COMMUNITY_TIMELINE = "https://schema.concrnt.world/t/community.json";
 
 // RFC3339タイムスタンプをns精度のepochに変換する(パース不能ならnull)。
 // サーバーのカーソル/ソートキーはμ秒以上の精度を持ちうるため、
@@ -885,34 +990,224 @@ const epochNs = (iso: string): bigint | null => {
     return BigInt(baseMs) * 1_000_000n + BigInt(frac || '0');
 };
 
+const epochNsToIso = (ns: bigint): string => {
+    const seconds = ns / 1_000_000_000n;
+    const fraction = (ns % 1_000_000_000n).toString().padStart(9, '0');
+    return `${new Date(Number(seconds * 1_000n)).toISOString().slice(0, 19)}.${fraction}Z`;
+};
+
+interface ParsedOutboxCursor { until: string, afterHref?: string, legacyTieOffset?: number }
+const TIED_CURSOR_PREFIX = 'tied:';
+
+const parseOutboxCursor = (cursor: string | null): ParsedOutboxCursor | null => {
+    if (cursor == null || cursor === '') return null;
+    if (!cursor.startsWith(TIED_CURSOR_PREFIX)) {
+        return epochNs(cursor) == null ? null : { until: cursor };
+    }
+    try {
+        const value = JSON.parse(decodeURIComponent(cursor.slice(TIED_CURSOR_PREFIX.length)));
+        if (typeof value?.until !== 'string' || epochNs(value.until) == null) return null;
+        if (typeof value.afterHref === 'string') return { until: value.until, afterHref: value.afterHref };
+        // 直前リリースが発行したoffset cursorも一度だけ受理し、次ページから安定キーへ移行する。
+        if (Number.isSafeInteger(value.tieOffset) && value.tieOffset >= 0) {
+            return { until: value.until, legacyTieOffset: value.tieOffset };
+        }
+        return null;
+    } catch {
+        return null;
+    }
+};
+
+const stableOutboxCursor = (until: string, afterHref: string): string =>
+    `${TIED_CURSOR_PREFIX}${encodeURIComponent(JSON.stringify({ until, afterHref }))}`;
+
+// ConcrntのCDIDはxをhash種別の先頭文字として予約するため、payload側は
+// i/l/o/xを除外しuを含む独自Base32を使う(core/cdidのencodingと同一)。
+const CDID_ALPHABET = "0123456789abcdefghjkmnpqrstuvwyz";
+
+const isHashCDID = (value: string): boolean =>
+    value.length === 25 && value[0] === 'x' &&
+    [...value.slice(1)].every(char => CDID_ALPHABET.includes(char));
+
+interface OutboxRef { href: string, schema?: string, keyNs: bigint }
+
+const parseOutboxRef = (sd: SignedDocument): OutboxRef | null => {
+    let refDoc: any;
+    try { refDoc = JSON.parse(sd.document); } catch { return null; }
+    const href: string | undefined = refDoc.value?.href;
+    const keyNs = epochNs(refDoc.value?.createdAt ?? refDoc.createdAt ?? '');
+    return href && keyNs != null ? { href, schema: refDoc.value?.schema, keyNs } : null;
+};
+
+const referenceParent = (key: string | undefined, listenPrefix: string): string | null => {
+    if (!key || !key.startsWith(listenPrefix)) return null;
+    const slash = key.lastIndexOf('/');
+    if (slash < 0 || !isHashCDID(key.slice(slash + 1))) return null;
+    return key.slice(0, slash);
+};
+
+// Core queryのtimestamp cursorは同一時刻内のdocument idを表現できない。
+// limitを超える同時刻行では同じcursorが返り続けるため、その時刻だけhash-CDIDの
+// key prefixを再帰分割して全行を回収する。配布referenceはCIP-7によりx+24文字の
+// hash-CDIDへ正規化されているので、各leafは一意になり必ず収束する。
+const fetchExactTiedOutboxRefs = async (timeline: string, author: string, cursor: string): Promise<OutboxRef[]> => {
+    const directPrefix = `${timeline.replace(/\/$/, '')}/`;
+    const prefixes = [`${directPrefix}x`];
+    const refs: OutboxRef[] = [];
+
+    while (prefixes.length > 0) {
+        const prefix = prefixes.pop()!;
+        const page = await concrntApi.requestConcrntApi<{ items: SignedDocument[], next: string | null }>(
+            config.concrnt.domain,
+            'net.concrnt.core.query',
+            { prefix, author, since: cursor, until: cursor, limit: '100', order: 'desc' },
+        );
+
+        if (page.next != null && prefix.length < directPrefix.length + 25) {
+            for (const char of CDID_ALPHABET) prefixes.push(prefix + char);
+            continue;
+        }
+
+        for (const sd of page.items) {
+            const key = sd.cckv;
+            const suffix = key?.startsWith(directPrefix) ? key.slice(directPrefix.length) : '';
+            if (!isHashCDID(suffix)) continue;
+            const ref = parseOutboxRef(sd);
+            if (ref) {
+                refs.push(ref);
+                if (refs.length > OUTBOX_MAX_TIED_REFS) {
+                    throw new Error(`too many tied outbox references below ${timeline}`);
+                }
+            }
+        }
+    }
+
+    return refs;
+};
+
+const listTimelineRoots = async (listenPrefix: string): Promise<string[]> => {
+    const roots = new Set<string>();
+    for (const schema of [SCHEMA_USER_TIMELINE, SCHEMA_COMMUNITY_TIMELINE]) {
+        const visitedCursors = new Set<string>();
+        let until: string | undefined;
+
+        for (;;) {
+            const params: Record<string, string> = {
+                prefix: listenPrefix,
+                schema,
+                limit: '100',
+                order: 'desc',
+            };
+            if (until != null) params.until = until;
+            const page = await concrntApi.requestConcrntApi<{ items: SignedDocument[], next: string | null }>(
+                config.concrnt.domain,
+                'net.concrnt.core.query',
+                params,
+            );
+            for (const sd of page.items) {
+                if (sd.cckv?.startsWith(listenPrefix)) roots.add(sd.cckv.replace(/\/$/, ''));
+            }
+            if (page.next == null) break;
+            // timeline定義自体が100件超で同一時刻の場合、完全列挙できないCore cursorを
+            // 進めて投稿を落とすよりoutboxを失敗させ、再試行可能な状態を保つ。
+            if (visitedCursors.has(page.next)) {
+                throw new Error(`cannot enumerate tied timeline roots below ${listenPrefix}`);
+            }
+            visitedCursors.add(page.next);
+            until = page.next;
+        }
+    }
+    return [...roots];
+};
+
+// listenTimelinesは個別timelineだけでなく親prefixも許す。まず同時刻のprefix検索から
+// 実際のreference親を列挙し、100件を超える場合は参照先recordのdistributesも使って
+// 同じ投稿に属する未取得の親を補完してから、各hash-CDID空間を個別に分割する。
+const fetchTiedOutboxRefs = async (listenPrefix: string, author: string, cursor: string): Promise<OutboxRef[]> => {
+    const page = await concrntApi.requestConcrntApi<{ items: SignedDocument[], next: string | null }>(
+        config.concrnt.domain,
+        'net.concrnt.core.query',
+        { prefix: listenPrefix, author, since: cursor, until: cursor, limit: '100', order: 'desc' },
+    );
+    const refs = page.items.map(parseOutboxRef).filter((ref): ref is OutboxRef => ref != null);
+    if (page.next == null) return refs;
+
+    const timelines = new Set<string>();
+    for (const sd of page.items) {
+        const parent = referenceParent(sd.cckv, listenPrefix);
+        if (parent) timelines.add(parent);
+    }
+
+    for (const timeline of await listTimelineRoots(listenPrefix)) timelines.add(timeline);
+
+    // 同一投稿のreference群はcreatedAtも同じなので、取得済みhrefから元recordを解決すれば
+    // そのdistributesに含まれる他の子timelineも列挙できる。
+    await Promise.all(refs.map(async (ref) => {
+        let document: any;
+        try {
+            document = await concrntApi.getDocument<any>(ref.href, undefined, { negativeTTL: 300_000 });
+        } catch (error) {
+            if (error instanceof NotFoundError) return;
+            throw error;
+        }
+        const distributes: unknown = document?.distributes;
+        if (!Array.isArray(distributes)) return;
+        for (const destination of distributes) {
+            if (typeof destination === 'string' && destination.startsWith(listenPrefix)) {
+                timelines.add(destination.replace(/\/$/, ''));
+            }
+        }
+    }));
+
+    if (timelines.size === 0) return refs;
+    if (timelines.size > OUTBOX_MAX_TIED_REFS) throw new Error(`too many timeline roots below ${listenPrefix}`);
+    const recovered: OutboxRef[] = [];
+    for (const timeline of timelines) {
+        recovered.push(...await fetchExactTiedOutboxRefs(timeline, author, cursor));
+        if (recovered.length > OUTBOX_MAX_TIED_REFS) {
+            throw new Error(`too many tied outbox references below ${listenPrefix}`);
+        }
+    }
+    return recovered;
+};
+
 federation.setOutboxDispatcher(
-    "/ap/acct/{identifier}/outbox",
+    `${actorPath}/{identifier}/outbox`,
     async (ctx, identifier, cursor) => {
         const entity = await db.select().from(apEntity)
             .where(eq(apEntity.id, identifier)).limit(1).then(res => res[0]);
         if (!entity) return null;
 
-        if (cursor && Number.isNaN(Date.parse(cursor))) return null;
+        const parsedCursor = parseOutboxCursor(cursor);
+        if (cursor && parsedCursor == null) return null;
 
         // 新規entityがdaemonの60秒周期ロードより先に読まれた場合に備える(ロード済みならno-op)
-        await settingsStore.ensureEntitySettingsLoaded(entity.ccid).catch(() => {});
-        const listenTimelines = settingsStore.getListenTimelines(entity.ccid);
+        await settingsStore.ensureEntitySettingsLoaded(entity.ccid);
+        const listenTimelines = [...new Set(settingsStore.getListenTimelines(entity.ccid))]
+            .slice(0, settingsStore.MAX_LISTEN_TIMELINES);
         const timelines = listenTimelines.length > 0
             ? listenTimelines
             : [`cckv://${entity.ccid}/concrnt.world/profiles/main/home-timeline`];
 
         const activities: Activity[] = [];
         const seen = new Set<string>();
-        let until = cursor || undefined;
+        let until = parsedCursor?.until;
+        let afterHref = parsedCursor?.afterHref;
+        let legacyTieOffset = parsedCursor?.legacyTieOffset ?? 0;
         let nextCursor: string | null = null;
 
         for (let round = 0; round < OUTBOX_MAX_SCAN_ROUNDS && activities.length < OUTBOX_PAGE_SIZE; round++) {
-            const refs: { href: string, schema?: string, keyNs: bigint }[] = [];
+            let refs: OutboxRef[] = [];
+            // 同じround内の複数timelineだけを重複排除する。境界以下で次roundへ
+            // 保留した参照は、inclusive cursorで再取得できるようglobalなseenへ入れない。
+            const roundSeen = new Set<string>();
             let boundary: { ns: bigint, cursor: string } | null = null;
 
             for (const timeline of timelines) {
                 const params: Record<string, string> = {
-                    parent: timeline,
+                    // listenTimelinesはdaemon側でstartsWithのprefixとして扱うため、
+                    // 履歴outboxも同じ範囲を列挙する。
+                    prefix: timeline,
                     author: entity.ccid,
                     limit: String(OUTBOX_FETCH_LIMIT),
                     order: 'desc',
@@ -925,8 +1220,8 @@ federation.setOutboxDispatcher(
                     let refDoc: any;
                     try { refDoc = JSON.parse(sd.document); } catch { continue; }
                     const href: string | undefined = refDoc.value?.href;
-                    if (!href || seen.has(href)) continue; // 複数timeline重複のdedupe
-                    seen.add(href);
+                    if (!href || seen.has(href) || roundSeen.has(href)) continue;
+                    roundSeen.add(href);
                     // サーバーのソートキーと同じ導出: 参照先のcreatedAt、無ければreference自身
                     const keyNs = epochNs(refDoc.value?.createdAt ?? refDoc.createdAt ?? '');
                     if (keyNs == null) continue;
@@ -944,8 +1239,35 @@ federation.setOutboxDispatcher(
             // 「境界より厳密に新しい」行だけを今回のページに載せる。境界タイと
             // 保留分はuntil境界包含により次ページで必ず返る
             const b = boundary;
-            const emittable = b != null ? refs.filter(r => r.keyNs > b.ns) : refs;
-            emittable.sort((x, y) => (x.keyNs < y.keyNs ? 1 : x.keyNs > y.keyNs ? -1 : 0));
+            const stalled = b != null && b.cursor === until;
+            if (stalled) {
+                const tied: OutboxRef[] = [];
+                for (const timeline of timelines) {
+                    tied.push(...await fetchTiedOutboxRefs(timeline, entity.ccid, b.cursor));
+                    if (tied.length > OUTBOX_MAX_TIED_REFS) {
+                        throw new Error(`too many tied outbox references for ${identifier}`);
+                    }
+                }
+                const tieSeen = new Set<string>();
+                refs = tied.filter((ref) => {
+                    if (seen.has(ref.href) || tieSeen.has(ref.href)) return false;
+                    tieSeen.add(ref.href);
+                    return true;
+                });
+            }
+            const resumeNs = until == null ? null : epochNs(until);
+            if (afterHref != null && resumeNs != null) {
+                refs = refs.filter((ref) =>
+                    ref.keyNs < resumeNs || (ref.keyNs === resumeNs && ref.href > afterHref!));
+            }
+            refs.sort((x, y) =>
+                x.keyNs < y.keyNs ? 1 : x.keyNs > y.keyNs ? -1 : x.href < y.href ? -1 : x.href > y.href ? 1 : 0);
+            const candidates = stalled ? refs : b != null ? refs.filter(r => r.keyNs > b.ns) : refs;
+            const start = stalled ? Math.min(legacyTieOffset, candidates.length) : 0;
+            const capacity = OUTBOX_PAGE_SIZE - activities.length;
+            const pageEnd = Math.min(candidates.length, start + capacity);
+            const emittable = candidates.slice(start, pageEnd);
+            const pageWasCapped = pageEnd < candidates.length;
 
             for (const ref of emittable) {
                 // author未対応の旧サーバーでは受信リモートノートのreference等が混ざるため、
@@ -954,32 +1276,50 @@ federation.setOutboxDispatcher(
                 if (ref.href.startsWith(`cckv://${entity.ccid}/${AP_NAMESPACE}/`)) continue;
                 if (ref.schema === SCHEMA_REFERENCE) continue;
 
-                const document = await concrntApi.getDocument<any>(ref.href, undefined, { negativeTTL: 300_000 })
-                    .catch(() => null);
-                if (document == null) continue; // 削除済み・取得失敗
+                let document: any;
+                try {
+                    // Outbox is public: a previously public cache entry cannot
+                    // authorize disclosure after the document's policy changes.
+                    document = await concrntApi.getDocument<any>(ref.href, undefined, { cache: 'no-cache', auth: 'no-auth' });
+                } catch (error) {
+                    if (error instanceof NotFoundError || error instanceof PermissionError) continue; // 不在/匿名アクセス拒否
+                    throw error; // 一過性障害ではcursorを進めず同じページを再試行させる
+                }
                 // daemon側のfederate対象判定と同一基準
                 if (document.author !== entity.ccid || document.kind !== 'record') continue;
                 if (document.schema === SCHEMA_REFERENCE) continue;
 
                 // 一覧は匿名fetchなので、ここまで来た投稿は公開段で確定
-                const activity = await buildActivity(ctx, { identifier, id: document.key ?? ref.href }, document, 'public')
-                    .catch(() => null);
+                // 一時的な変換/取得障害はcursorを進めず、同じページを再試行させる。
+                const activity = await buildActivity(ctx, { identifier, id: document.key ?? ref.href }, document, 'public', {
+                    targetResolution: 'strict-public',
+                });
                 if (activity == null) continue; // Note化不能・Announce先解決不能
                 activities.push(activity);
+                seen.add(ref.href);
             }
 
             if (boundary == null) {
-                // 全timeline終端
-                nextCursor = null;
+                const last = emittable.at(-1);
+                nextCursor = pageWasCapped && last
+                    ? stableOutboxCursor(epochNsToIso(last.keyNs), last.href)
+                    : null;
                 break;
             }
-            if (boundary.cursor === until) {
-                // カーソルが進まない場合は打ち切る(CIP-5 §3.3)
-                nextCursor = null;
+            if (pageWasCapped) {
+                const last = emittable.at(-1)!;
+                nextCursor = stableOutboxCursor(epochNsToIso(last.keyNs), last.href);
+                break;
+            }
+            if (stalled) {
+                // bucketを処理し終えた時だけ1ns前へ進む。
+                nextCursor = epochNsToIso(b.ns - 1n);
                 break;
             }
             nextCursor = boundary.cursor;
             until = boundary.cursor;
+            afterHref = undefined;
+            legacyTieOffset = 0;
         }
 
         return { items: activities, nextCursor };
@@ -994,7 +1334,7 @@ federation.setOutboxDispatcher(
 });
 
 federation.setFollowersDispatcher(
-    "/ap/acct/{identifier}/followers",
+    `${actorPath}/{identifier}/followers`,
     async (ctx, identifier) => {
         const entity = await db.select().from(apEntity)
             .where(eq(apEntity.id, identifier)).limit(1).then(res => res[0]);
@@ -1021,7 +1361,7 @@ federation.setFollowersDispatcher(
 
 federation.setObjectDispatcher(
     Note,
-    "/ap/acct/{identifier}/posts/{+id}",
+    `${actorPath}/{identifier}/posts/{+id}`,
     async (ctx, values) => {
 
         const entity = await db.select().from(apEntity).where(eq(apEntity.id, values.identifier)).limit(1);

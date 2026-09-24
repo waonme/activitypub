@@ -247,7 +247,7 @@ const handleProfileUpdate = async (entity: ApEntity) => {
         { identifier: entity.id },
         "followers",
         new Update({
-            id: new URL(`${config.activitypub.baseUrl}/ap/acct/${entity.id}#update-${Date.now()}`),
+            id: new URL(`${config.activitypub.baseUrl}/ap/${config.activitypub.actorPathSegment}/${entity.id}#update-${Date.now()}`),
             actor: ctx.getActorUri(entity.id),
             object: person,
             tos: [PUBLIC_COLLECTION],
@@ -421,8 +421,15 @@ const followActivityId = (recordKey: string) =>
 export interface ResendFollowResult { ccid: string, actorURI: string, status: 'sent' | 'failed' | 'skipped', reason?: string }
 
 export const resendPendingFollows = async (opts: { ccid?: string, actorURIs?: string[], dryRun?: boolean }): Promise<ResendFollowResult[]> => {
+    if (opts.ccid !== undefined && opts.ccid.trim() === '') {
+        throw new TypeError('ccid must be a non-empty string when provided');
+    }
     const ctx = fedi.createContext(new URL(config.activitypub.baseUrl), undefined);
-    const wanted = opts.actorURIs?.length ? new Set(opts.actorURIs) : null;
+    // propertyが無い時だけ全pendingを対象にする。明示された空配列は「対象なし」。
+    const wanted = opts.actorURIs === undefined ? null : new Set(opts.actorURIs);
+
+    // accept-stateをpendingの既定値と区別できる状態にしてから対象を列挙する。
+    await followStore.ensureServiceRecordsLoaded();
 
     let entities = await db.select().from(apEntity).where(eq(apEntity.enabled, true));
     if (opts.ccid) entities = entities.filter((e) => e.ccid === opts.ccid);

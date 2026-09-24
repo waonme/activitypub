@@ -1,4 +1,4 @@
-import { boolean, pgTable, text, date, primaryKey, jsonb, index } from 'drizzle-orm/pg-core'
+import { boolean, pgTable, text, date, primaryKey, jsonb, index, timestamp } from 'drizzle-orm/pg-core'
 
 export const apEntity = pgTable("ap_entities", {
     id: text("id").notNull().primaryKey(),
@@ -46,3 +46,27 @@ export const apObjectReference = pgTable(
 
 export type ApObjectReferenceRow = typeof apObjectReference.$inferSelect;
 
+// Inbox delivery is the only reliable copy of followers-only/direct objects:
+// many remote servers intentionally reject later anonymous dereferencing.
+// Redis remains the fast path, while this table is the durable fallback used
+// after cache expiry, process restarts, and upgrades from the former snapshot
+// implementation.
+export const apInboundObject = pgTable(
+    "ap_inbound_objects",
+    {
+        objectId: text("object_id").notNull().primaryKey(),
+        actorId: text("actor_id").notNull(),
+        object: jsonb("object").$type<Record<string, unknown>>().notNull(),
+        recipientCcids: text("recipient_ccids").array().notNull().default([]),
+        // Legacy rows also contain public/unlisted snapshots. New writes keep
+        // only restricted objects, but the type must describe the live table.
+        visibility: text("visibility").$type<"public" | "unlisted" | "followers" | "direct">().notNull(),
+        cDate: timestamp("c_date", { withTimezone: true }).notNull().defaultNow(),
+        updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => [
+        index("ap_inbound_objects_actor_id_idx").on(table.actorId),
+    ],
+);
+
+export type ApInboundObjectRow = typeof apInboundObject.$inferSelect;
