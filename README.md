@@ -92,6 +92,23 @@ pnpm test       # vitest
 pnpm lint       # eslint
 ```
 
+### このフォークの公開先
+
+公開先は GitHub Release の `waonme/activitypub` とコンテナの `ghcr.io/waonme/activitypub` に限定しています。
+Release・Docker の公開ジョブはリポジトリ名と所有者を照合し、ログインや公開の前に `scripts/check-release-target.ts` が実際の `.goreleaser.yaml` と実行環境の公開先を確認します。GoReleaser の before-hook でも同じ検証を実行します。設定不一致・リポジトリ識別情報の欠落はエラーで停止します。
+
+ローカルで公開先だけを検証する場合は、依存関係をインストールした上で次を実行します。検証コマンド自体は公開やネットワーク操作を行いません。
+
+```sh
+GITHUB_REPOSITORY=waonme/activitypub GITHUB_REPOSITORY_OWNER=waonme \
+  node --import tsx scripts/check-release-target.ts github
+GITHUB_REPOSITORY=waonme/activitypub GITHUB_REPOSITORY_OWNER=waonme \
+  REGISTRY=ghcr.io IMAGE_NAME=waonme/activitypub \
+  node --import tsx scripts/check-release-target.ts docker
+```
+
+`main` 以外のブランチへの push と PR は Check による検証のみです。既存の公開トリガーは、GitHub Release が `v*.*.*` タグ、Docker が `main`・同形式タグ・手動実行です。公開ガードの追加や検証成功は、それらの実行・タグ作成・本番反映の許可を意味しません。上流由来のアプリ名・ライセンス・作者表記は保持しています。
+
 ### メトリクス
 
 fedify組み込みのOpenTelemetryメトリクス(配送・inbox処理・署名検証・キュー深さ等)を`GET /metrics`でPrometheus形式で公開する(`src/metrics.ts`)。

@@ -2,8 +2,11 @@ name: Check
 
 on:
   push:
-    branches: [ 'main' ]
+    branches: [ '**' ]
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   check:
@@ -27,8 +30,14 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Validate fork release destination
+        run: node --import tsx scripts/check-release-target.ts github
+
       - name: Typecheck
         run: pnpm typecheck
 
       - name: Test
         run: pnpm test
+
+      - name: Lint
+        run: pnpm lint
